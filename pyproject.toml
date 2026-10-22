@@ -1,0 +1,11 @@
+[project]
+name = "fasih-auto-cleaning"
+version = "0.1.0"
+description = "Bot auto-fill dan otomasi kuesioner FASIH-SM BPS SE2026"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "playwright>=1.40.0",
+    "rich>=13.0.0",
+]

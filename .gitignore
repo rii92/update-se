@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+env/
+venv/
+
+# Playwright & Chrome User Data / Sessions
+browser_data/
+chrome_data/
+session.json
+*.session
+screenshots/
+*.png
+
+# Checkpoints & Results
+source/*_progress.json
+source/*_result.xlsx
+~$*.xlsx
+
+# IDE / Mac
+.DS_Store
+.idea/
+.vscode/
+
