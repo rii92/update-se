@@ -161,8 +161,14 @@ Gunakan skrip `update_penjualan.py` untuk mengubah nilai penjualan/pendapatan pa
 |-------|------------|
 | `link` | Link assignment FASIH (boleh tanpa `/edit`) |
 | `nama_usaha` | Nama sub-blok usaha, contoh: `BENGKEL MOTOR [SUPARDI]` |
-| `nilai_penjualan` | Nilai penjualan/pendapatan yang akan diisi, contoh: `52834000` |
-| `komentar` | Komentar catatan pada field nilai penjualan, contoh: `#1` |
+| `nilai_penjualan` | 27.a Nilai penjualan barang dan jasa, contoh: `52834000` |
+| `biaya_pembelian` | 27.b Biaya pembelian barang yang terjual |
+| `biaya_produksi` | 27.c Biaya produksi |
+| `biaya_operasional` | 27.d Biaya operasional |
+| `upah` | 26.a Upah/gaji, contoh: `24000000` |
+| `komentar` | (opsional) komentar otomatis `#1` bila nilai berubah, `#0` bila sama |
+
+> Format lama (hanya `link`, `nama_usaha`, `nilai_penjualan`, `komentar`) tetap didukung; kolom biaya/upah akan dianggap kosong.
 
 > [!TIP]
 > Buat file contoh otomatis dengan `python update_penjualan.py --init-sample`, lalu isi barisnya.
@@ -172,11 +178,12 @@ Gunakan skrip `update_penjualan.py` untuk mengubah nilai penjualan/pendapatan pa
 2. **Otomatis Login SSO BPS** jika sesi habis (kredensial dari `config.py`).
 3. **Membuka mode edit** (`.../edit`).
 4. **Masuk section `KETERANGAN USAHA/PERUSAHAAN`** → Memilih sub-blok usaha sesuai `nama_usaha`.
-5. **Mengisi textfield nilai penjualan** sesuai kolom `nilai_penjualan`.
-6. **Membuka tombol Catatan** pada field nilai penjualan → isi komentar (mis. `#1`) → simpan.
-7. **Masuk section `CATATAN`** → aktifkan switch **`Tampilkan Anomali Usaha dan Keluarga`**, aktifkan switch **`Anomali diselesaikan oleh admin`**, isi penjelasan `-`.
-8. **Validasi 0 Galat** → Klik **Kirim** → Konfirmasi → Verifikasi submit sukses.
-9. **Rekap Hasil**: Hasil eksekusi otomatis direkap dan diekspor ke `source/penjualan_result.xlsx`.
+5. **Mengisi 5 variabel**: `nilai_penjualan`, `biaya_pembelian`, `biaya_produksi`, `biaya_operasional`, dan `upah` (wrapper dicari via prefix agar suffix dinamis tetap cocok).
+6. **Membuka tombol Catatan** pada tiap field → isi komentar otomatis `#1`/`#0` → simpan.
+7. **Menambah catatan KBLI** (`kbli#`, fallback `kbli_genai#`) dengan default `#0`.
+8. **Masuk section `CATATAN`** → aktifkan switch **`Tampilkan Anomali Usaha dan Keluarga`**, aktifkan switch **`Anomali diselesaikan oleh admin`**, isi penjelasan `-`.
+9. **Validasi 0 Galat** → Klik **Kirim** → Konfirmasi → Verifikasi submit sukses.
+10. **Rekap Hasil**: Hasil eksekusi otomatis direkap dan diekspor ke `source/penjualan_result.xlsx`.
 
 ### Contoh Perintah:
 

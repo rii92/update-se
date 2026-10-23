@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Batch Automation Update 4 Variabel Nilai & Komentar FASIH-SM SE2026
-Mengubah 4 variabel pada blok "KETERANGAN USAHA/PERUSAHAAN" (rincian Blok 27)
+Batch Automation Update 5 Variabel Nilai & Komentar FASIH-SM SE2026
+Mengubah 5 Variabel pada blok "KETERANGAN USAHA/PERUSAHAAN" (rincian Blok 27)
 berdasarkan file Excel (source/penjualan.xlsx) hanya dengan 1 perintah:
 
 1. Otomatis membuka Google Chrome dengan profil terisolasi (./chrome_data).
@@ -11,11 +11,12 @@ berdasarkan file Excel (source/penjualan.xlsx) hanya dengan 1 perintah:
    a. Membuka link kuesioner dalam mode edit (.../edit).
    b. Masuk ke section "KETERANGAN USAHA/PERUSAHAAN".
    c. Memilih sub-blok usaha sesuai "NAMA USAHA".
-   d. Mengisi 4 variabel berikut (urut) + catatan pada masing-masing:
+   d. Mengisi 5 variabel berikut (urut) + catatan pada masing-masing:
         1) Nilai penjualan barang dan jasa       (wrapper prefix: nilai_pendapatan)
         2) Biaya pembelian barang yang terjual   (wrapper prefix: biaya_pembelian)
         3) Biaya produksi                        (wrapper prefix: biaya_produksi)
         4) Biaya operasional                     (wrapper prefix: operasional)
+        5) Upah/gaji                             (wrapper prefix: gaji)
         Komentar otomatis: "#1" jika nilai berubah, "#0" jika nilai sama/tidak berubah.
         (Wrapper dicari via PREFIX id karena suffix dinamis, mis. #1 / #1101, dan
          mendukung varian bulanan "_bln".)
@@ -31,6 +32,7 @@ Kolom file sumber (source/penjualan.xlsx):
     biaya_pembelian    : 27.b Biaya pembelian barang yang terjual
     biaya_produksi     : 27.c Biaya produksi
     biaya_operasional  : 27.d Biaya operasional
+    upah               : 26.a Upah/gaji
     komentar           : (opsional/diabaikan) komentar kini otomatis #1/#0 per nilai
 
 Contoh:
@@ -44,6 +46,7 @@ Contoh:
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -64,12 +67,13 @@ PROGRESS_FILE = Path("source/penjualan_progress.json")
 RESULT_EXCEL_FILE = Path("source/penjualan_result.xlsx")
 DEFAULT_SOURCE_FILE = Path("source/penjualan.xlsx")
 
-# 4 variabel yang diubah, urut. Key = kolom Excel, value = id wrapper React pada halaman.
+# 5 Variabel yang diubah, urut. Key = kolom Excel, value = id wrapper React pada halaman.
 VARIABEL_MAP = [
     ("nilai_penjualan", "nilai_pendapatan", "27.a Nilai penjualan barang dan jasa"),
     ("biaya_pembelian", "biaya_pembelian", "27.b Biaya pembelian barang yang terjual"),
     ("biaya_produksi", "biaya_produksi", "27.c Biaya produksi"),
     ("biaya_operasional", "operasional", "27.d Biaya operasional"),
+    ("upah", "gaji", "26.a Upah/gaji"),
 ]
 
 
@@ -80,7 +84,7 @@ def create_sample_source(file_path: Path = DEFAULT_SOURCE_FILE):
     ws.title = "Penjualan"
     ws.append([
         "link", "nama_usaha", "nilai_penjualan", "biaya_pembelian",
-        "biaya_produksi", "biaya_operasional", "komentar",
+        "biaya_produksi", "biaya_operasional", "upah", "komentar",
     ])
     ws.append([
         config.DEFAULT_ASSIGNMENT_URL,
@@ -89,6 +93,7 @@ def create_sample_source(file_path: Path = DEFAULT_SOURCE_FILE):
         "83328000",
         "1812000",
         "4228000",
+        "24000000",
         "#1",
     ])
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +101,7 @@ def create_sample_source(file_path: Path = DEFAULT_SOURCE_FILE):
     console.print(f"[bold green]✔ Contoh file sumber dibuat:[/bold green] [yellow]{file_path}[/yellow]")
     console.print(
         "[dim]Kolom: link, nama_usaha, nilai_penjualan, biaya_pembelian, "
-        "biaya_produksi, biaya_operasional, komentar. Satu baris per usaha.[/dim]"
+        "biaya_produksi, biaya_operasional, upah, komentar. Satu baris per usaha.[/dim]"
     )
 
 
@@ -115,23 +120,52 @@ def load_progress() -> Dict[str, dict]:
         try:
             wb = openpyxl.load_workbook(RESULT_EXCEL_FILE, data_only=True)
             ws = wb.active
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if not row or not row[0]:
+            rows = ws.iter_rows(values_only=True)
+            header = next(rows, None) or []
+            norm = [str(h).strip().lower() if h is not None else "" for h in header]
+
+            def find_col(*keywords):
+                for i, h in enumerate(norm):
+                    if all(k in h for k in keywords):
+                        return i
+                return None
+
+            c_no = find_col("no")
+            c_link = find_col("link")
+            c_nama = find_col("usaha")
+            c_nilai = find_col("nilai")
+            c_pembelian = find_col("pembelian")
+            c_produksi = find_col("produksi")
+            c_operasional = find_col("operasional")
+            c_upah = find_col("upah")
+            c_komentar = find_col("komentar")
+            c_status = find_col("status")
+            c_detail = find_col("detail")
+            c_waktu = find_col("waktu")
+
+            for row in rows:
+                def get(c, default=""):
+                    if c is None or len(row) <= c or row[c] is None:
+                        return default
+                    return str(row[c]).strip()
+
+                idx_str = get(c_no)
+                if not idx_str:
                     continue
-                idx_str = str(row[0]).strip()
-                status = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+                status = get(c_status)
                 if idx_str not in progress and status:
                     progress[idx_str] = {
-                        "link": str(row[1]).strip() if len(row) > 1 and row[1] else "",
-                        "nama_usaha": str(row[2]).strip() if len(row) > 2 and row[2] else "",
-                        "nilai_penjualan": str(row[3]).strip() if len(row) > 3 and row[3] else "",
-                        "biaya_pembelian": str(row[4]).strip() if len(row) > 4 and row[4] else "",
-                        "biaya_produksi": str(row[5]).strip() if len(row) > 5 and row[5] else "",
-                        "biaya_operasional": str(row[6]).strip() if len(row) > 6 and row[6] else "",
-                        "komentar": str(row[7]).strip() if len(row) > 7 and row[7] else "#1",
+                        "link": get(c_link),
+                        "nama_usaha": get(c_nama),
+                        "nilai_penjualan": get(c_nilai),
+                        "biaya_pembelian": get(c_pembelian),
+                        "biaya_produksi": get(c_produksi),
+                        "biaya_operasional": get(c_operasional),
+                        "upah": get(c_upah),
+                        "komentar": get(c_komentar) or "#1",
                         "status": status,
-                        "detail": str(row[8]).strip() if len(row) > 8 and row[8] else "",
-                        "timestamp": str(row[9]).strip() if len(row) > 9 and row[9] else "",
+                        "detail": get(c_detail),
+                        "timestamp": get(c_waktu),
                     }
         except Exception:
             pass
@@ -140,10 +174,14 @@ def load_progress() -> Dict[str, dict]:
 
 
 def save_progress(data: Dict[str, dict]):
-    """Menyimpan data checkpoint ke file json."""
+    """Menyimpan data checkpoint ke file json secara atomik (aman bila proses terhenti)."""
     PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(PROGRESS_FILE, "w") as f:
+    tmp_path = PROGRESS_FILE.with_suffix(PROGRESS_FILE.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, PROGRESS_FILE)
 
 
 def export_result_excel(tasks: List[dict], progress_data: Dict[str, dict], output_path: Path):
@@ -154,7 +192,7 @@ def export_result_excel(tasks: List[dict], progress_data: Dict[str, dict], outpu
 
     headers = [
         "No", "Link", "Nama Usaha", "Nilai Penjualan", "Biaya Pembelian",
-        "Biaya Produksi", "Biaya Operasional", "Komentar",
+        "Biaya Produksi", "Biaya Operasional", "Upah", "Komentar",
         "Status", "Detail", "Waktu Eksekusi",
     ]
     ws.append(headers)
@@ -170,6 +208,7 @@ def export_result_excel(tasks: List[dict], progress_data: Dict[str, dict], outpu
             item["biaya_pembelian"],
             item["biaya_produksi"],
             item["biaya_operasional"],
+            item["upah"],
             item["komentar"],
             rec.get("status", "PENDING"),
             rec.get("detail", ""),
@@ -205,15 +244,17 @@ def read_excel_source(file_path: Path) -> List[dict]:
     pembelian_col = find_col("pembelian", fallback=None)
     produksi_col = find_col("produksi", fallback=None)
     operasional_col = find_col("operasional", fallback=None)
+    upah_col = find_col("upah", fallback=None)
 
     headers_str = " ".join(headers)
-    has_new = any(k in headers_str for k in ["pembelian", "produksi", "operasional"])
+    has_new = any(k in headers_str for k in ["pembelian", "produksi", "operasional", "upah"])
 
     if not has_new:
         # Old format: link, nama_usaha, nilai_penjualan, komentar
         pembelian_col = None
         produksi_col = None
         operasional_col = None
+        upah_col = None
         komentar_col = 3
 
     def cell(row, col, default=""):
@@ -231,6 +272,7 @@ def read_excel_source(file_path: Path) -> List[dict]:
         pembelian = cell(row, pembelian_col)
         produksi = cell(row, produksi_col)
         operasional = cell(row, operasional_col)
+        upah = cell(row, upah_col)
         komentar = cell(row, komentar_col) or "#1"
 
         if not nama_usaha:
@@ -245,6 +287,7 @@ def read_excel_source(file_path: Path) -> List[dict]:
             "biaya_pembelian": pembelian,
             "biaya_produksi": produksi,
             "biaya_operasional": operasional,
+            "upah": upah,
             "komentar": komentar,
         })
 
@@ -695,6 +738,21 @@ def _find_wrapper(page: Page, prefix: str, need_input: bool = True):
     return res
 
 
+def _expand_pengeluaran(page: Page) -> bool:
+    """Klik header section Pengeluaran agar field di dalamnya (mis. upah/gaji) terlihat."""
+    try:
+        return bool(page.evaluate("""(() => {
+            const h = document.querySelector('[id^="head_pengeluaran"]');
+            if (!h) return false;
+            const target = h.querySelector('div') || h;
+            target.scrollIntoView({ block: 'center' });
+            target.click();
+            return true;
+        })()"""))
+    except Exception:
+        return False
+
+
 def _set_nilai_field(page: Page, wrapper_id: str, value: str, komentar_value: str, label: str) -> Tuple[bool, str]:
     """
     Mengisi satu field nilai via PREFIX wrapper (mis. 'nilai_pendapatan') + catatannya.
@@ -707,6 +765,11 @@ def _set_nilai_field(page: Page, wrapper_id: str, value: str, komentar_value: st
 
     # 1) Cari wrapper + input via prefix
     found = _find_wrapper(page, wrapper_id, need_input=True)
+    if not found or not found.get("input"):
+        # Field upah/gaji kadang berada di section Pengeluaran yang belum terbuka
+        _expand_pengeluaran(page)
+        time.sleep(0.8)
+        found = _find_wrapper(page, wrapper_id, need_input=True)
     if not found or not found.get("input"):
         return False, f"TextField '{label}' (prefix {wrapper_id}) tidak ditemukan"
     wrapper_exact = found["wrapper"]
@@ -904,17 +967,19 @@ def update_penjualan_row(
     biaya_pembelian: str = "",
     biaya_produksi: str = "",
     biaya_operasional: str = "",
+    upah: str = "",
     komentar_value: str = "#1",
     kbli_catatan: str = "#0",
     kbli_wrapper_id: str = "kbli#",
     retry_on_logout: bool = True,
 ) -> Tuple[bool, str]:
     """
-    Menjalankan alur update 4 variabel nilai & komentar untuk satu usaha:
+    Menjalankan alur update 5 variabel nilai & komentar untuk satu usaha:
     1. Buka kuesioner (mode edit).
     2. Masuk section KETERANGAN USAHA/PERUSAHAAN, pilih sub-blok usaha.
     3. Untuk tiap variabel (27.a nilai penjualan, 27.b biaya pembelian,
-       27.c biaya produksi, 27.d biaya operasional): isi nilai + catatan.
+       27.c biaya produksi, 27.d biaya operasional, 26.a upah/gaji):
+       isi nilai + catatan.
     4. Tambah catatan KBLI.
     5. Submit assignment (CATATAN -> switch anomali -> Kirim -> Konfirmasi).
     """
@@ -927,6 +992,7 @@ def update_penjualan_row(
         "biaya_pembelian": biaya_pembelian,
         "biaya_produksi": biaya_produksi,
         "biaya_operasional": biaya_operasional,
+        "upah": upah,
     }
 
     try:
@@ -938,7 +1004,7 @@ def update_penjualan_row(
 
     if is_page_logged_out(page):
         if retry_on_logout and perform_sso_login(page):
-            return update_penjualan_row(page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi, biaya_operasional, komentar_value, kbli_catatan, kbli_wrapper_id, retry_on_logout=False)
+            return update_penjualan_row(page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi, biaya_operasional, upah, komentar_value, kbli_catatan, kbli_wrapper_id, retry_on_logout=False)
         return False, "Sesi login habis / terlogout"
 
     try:
@@ -946,7 +1012,7 @@ def update_penjualan_row(
     except Exception:
         if is_page_logged_out(page) and retry_on_logout:
             if perform_sso_login(page):
-                return update_penjualan_row(page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi, biaya_operasional, komentar_value, kbli_catatan, kbli_wrapper_id, retry_on_logout=False)
+                return update_penjualan_row(page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi, biaya_operasional, upah, komentar_value, kbli_catatan, kbli_wrapper_id, retry_on_logout=False)
         return False, "Menu sidebar (aside) kuesioner tidak muncul"
 
     time.sleep(1.0)
@@ -962,7 +1028,7 @@ def update_penjualan_row(
         return False, f"Sub-blok usaha '{nama_usaha}' tidak ditemukan"
     time.sleep(1.5)
 
-    # 3. Isi 4 variabel (urut) + catatan
+    # 3. Isi 5 Variabel (urut) + catatan
     for col_key, wrapper_id, label in VARIABEL_MAP:
         ok, detail = _set_nilai_field(page, wrapper_id, values.get(col_key, ""), komentar_value, label)
         if not ok:
@@ -985,11 +1051,11 @@ def update_penjualan_row(
         return False, f"Gagal submit assignment: {submit_msg}"
 
     console.print(f"   [bold green]✔ Sukses Submit Assignment: {submit_msg}[/bold green]")
-    return True, f"4 variabel + catatan (komentar otomatis #1 jika berubah, #0 jika sama; KBLI '{kbli_catatan}') disimpan, {submit_msg}"
+    return True, f"5 Variabel + catatan (komentar otomatis #1 jika berubah, #0 jika sama; KBLI '{kbli_catatan}') disimpan, {submit_msg}"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch Automation Update 4 Variabel Nilai (Blok 27) FASIH-SM SE2026 (1-Command)")
+    parser = argparse.ArgumentParser(description="Batch Automation Update 5 Variabel Nilai (Blok 27) FASIH-SM SE2026 (1-Command)")
     parser.add_argument("--source", default=str(DEFAULT_SOURCE_FILE), help="File Excel sumber data (default: source/penjualan.xlsx)")
     parser.add_argument("--init-sample", action="store_true", help="Buat file Excel sumber contoh lalu keluar")
     parser.add_argument("--start", type=int, default=1, help="Nomor baris awal untuk mulai diproses (default: 1)")
@@ -1032,7 +1098,7 @@ def main():
 
     console.print(
         Panel.fit(
-            f"[bold cyan]⚡ FASIH-SM Batch Update 4 Variabel Nilai (Blok 27) Engine[/bold cyan]\n"
+            f"[bold cyan]⚡ FASIH-SM Batch Update 5 Variabel Nilai (Blok 27) Engine[/bold cyan]\n"
             f"File Sumber      : [yellow]{source_path}[/yellow] (Total {total_in_file} baris)\n"
             f"SSO User         : [bold green]{config.SSO_USERNAME}[/bold green] (Auto-Login: {config.AUTO_LOGIN_SSO})\n"
             f"Profil Browser   : [magenta]{config.BROWSER_DATA_DIR}[/magenta]\n"
@@ -1059,6 +1125,7 @@ def main():
         table.add_column("Pembelian", style="green")
         table.add_column("Produksi", style="green")
         table.add_column("Operasional", style="green")
+        table.add_column("Upah", style="green")
         table.add_column("Komentar", style="yellow")
         table.add_column("Status Terakhir", style="yellow")
 
@@ -1067,7 +1134,7 @@ def main():
             table.add_row(
                 str(t["index"]), t["nama_usaha"],
                 t["nilai_penjualan"], t["biaya_pembelian"],
-                t["biaya_produksi"], t["biaya_operasional"],
+                t["biaya_produksi"], t["biaya_operasional"], t["upah"],
                 t["komentar"], prev_status,
             )
 
@@ -1107,9 +1174,11 @@ def main():
 
         success_count = 0
         fail_count = 0
+        current_item = None
 
         try:
             for i, item in enumerate(filtered_tasks, start=1):
+                current_item = item
                 idx = item["index"]
                 link = item["link"]
                 nama_usaha = item["nama_usaha"]
@@ -1117,6 +1186,7 @@ def main():
                 pembelian = item["biaya_pembelian"]
                 produksi = item["biaya_produksi"]
                 operasional = item["biaya_operasional"]
+                upah = item["upah"]
                 komentar = item["komentar"]
                 curr_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1126,13 +1196,20 @@ def main():
                     f"Nilai   : Penjualan=[cyan]{nilai or '-'}[/cyan] "
                     f"Pembelian=[cyan]{pembelian or '-'}[/cyan] "
                     f"Produksi=[cyan]{produksi or '-'}[/cyan] "
-                    f"Operasional=[cyan]{operasional or '-'}[/cyan] | Komentar: [cyan]{komentar}[/cyan]"
+                    f"Operasional=[cyan]{operasional or '-'}[/cyan] "
+                    f"Upah=[cyan]{upah or '-'}[/cyan] | Komentar: [cyan]{komentar}[/cyan]"
                 )
                 console.print(f"Link    : [dim]{link}[/dim]")
 
-                is_ok, msg = update_penjualan_row(
-                    page, link, nama_usaha, nilai, pembelian, produksi, operasional, komentar
-                )
+                # Proses per baris; kegagalan/exception tak terduga tidak menghentikan batch.
+                try:
+                    is_ok, msg = update_penjualan_row(
+                        page, link, nama_usaha, nilai, pembelian, produksi, operasional, upah, komentar
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    is_ok, msg = False, f"Exception tak terduga: {e}"
 
                 status_str = "SUCCESS" if is_ok else "FAILED"
                 progress_data[str(idx)] = {
@@ -1142,12 +1219,14 @@ def main():
                     "biaya_pembelian": pembelian,
                     "biaya_produksi": produksi,
                     "biaya_operasional": operasional,
+                    "upah": upah,
                     "komentar": komentar,
                     "status": status_str,
                     "detail": msg,
                     "timestamp": curr_time_str,
                 }
                 save_progress(progress_data)
+                current_item = None
 
                 if is_ok:
                     success_count += 1
@@ -1164,12 +1243,30 @@ def main():
 
         except KeyboardInterrupt:
             console.print("\n[bold yellow]⚠ Eksekusi dihentikan pengguna (Ctrl+C). Checkpoint tersimpan aman![/bold yellow]")
+            # Catat baris yang sedang diproses (belum selesai) sebagai FAILED agar diulang lain waktu.
+            if current_item is not None:
+                idx_int = current_item["index"]
+                progress_data[str(idx_int)] = {
+                    "link": current_item["link"],
+                    "nama_usaha": current_item["nama_usaha"],
+                    "nilai_penjualan": current_item["nilai_penjualan"],
+                    "biaya_pembelian": current_item["biaya_pembelian"],
+                    "biaya_produksi": current_item["biaya_produksi"],
+                    "biaya_operasional": current_item["biaya_operasional"],
+                    "upah": current_item["upah"],
+                    "komentar": current_item["komentar"],
+                    "status": "FAILED",
+                    "detail": "Dihentikan pengguna (Ctrl+C) saat sedang diproses",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                save_progress(progress_data)
+                console.print(f"[yellow]↳ Baris #{idx_int} ditandai FAILED (terhenti) & akan dicoba ulang.[/yellow]")
         finally:
             export_result_excel(all_tasks, progress_data, RESULT_EXCEL_FILE)
             context.close()
             console.print(
                 Panel.fit(
-                    f"[bold cyan]📊 Rekapitulasi Update 4 Variabel Nilai[/bold cyan]\n"
+                    f"[bold cyan]📊 Rekapitulasi Update 5 Variabel Nilai[/bold cyan]\n"
                     f"Selesai Diproses : [bold]{success_count + fail_count}[/bold] baris\n"
                     f"Berhasil (Submit): [bold green]{success_count}[/bold green]\n"
                     f"Gagal            : [bold red]{fail_count}[/bold red]\n"
@@ -1182,3 +1279,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
