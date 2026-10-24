@@ -18,8 +18,7 @@ berdasarkan file Excel (source/penjualan.xlsx) hanya dengan 1 perintah:
         4) Biaya operasional                     (wrapper prefix: operasional)
         5) Upah/gaji                             (wrapper prefix: gaji)
         Komentar otomatis: "#1" jika nilai berubah, "#0" jika nilai sama/tidak berubah.
-        (Wrapper dicari via PREFIX id karena suffix dinamis, mis. #1 / #1101, dan
-         mendukung varian bulanan "_bln".)
+        Komentar manual per variabel bisa diisi lewat kolom remark_* di Excel.
    e. Menambah catatan pada field KBLI (prefix kbli#, fallback kbli_genai#) dengan
       default "#0" karena nilai KBLI tidak diubah.
    f. Submit assignment (masuk CATATAN -> switch anomali -> Kirim -> Konfirmasi).
@@ -34,6 +33,19 @@ Kolom file sumber (source/penjualan.xlsx):
     biaya_operasional  : 27.d Biaya operasional
     upah               : 26.a Upah/gaji
     komentar           : (opsional/diabaikan) komentar kini otomatis #1/#0 per nilai
+
+  Kolom opsional komentar manual per variabel (override otomatis #1/#0):
+    remark_nilai_penjualan, remark_biaya_pembelian, remark_biaya_produksi,
+    remark_biaya_operasional, remark_upah
+
+  Kolom opsional TIMPA catatan lama (isi 1 = timpa, kosong/0 = pertahankan catatan lama):
+    timpa_remark                       : berlaku untuk SEMUA variabel di baris itu
+    timpa_remark_nilai_penjualan       : khusus variabel 27.a (prioritas lebih tinggi)
+    timpa_remark_biaya_pembelian       : khusus 27.b
+    timpa_remark_biaya_produksi        : khusus 27.c
+    timpa_remark_biaya_operasional     : khusus 27.d
+    timpa_remark_upah                  : khusus 26.a
+    timpa_remark_kbli                  : khusus KBLI (default KBLI selalu ditimpa)
 
 Contoh:
     python update_penjualan.py --init-sample      # buat contoh file Excel
@@ -51,7 +63,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import openpyxl
 from playwright.sync_api import Page, sync_playwright
@@ -67,15 +79,95 @@ PROGRESS_FILE = Path("source/penjualan_progress.json")
 RESULT_EXCEL_FILE = Path("source/penjualan_result.xlsx")
 DEFAULT_SOURCE_FILE = Path("source/penjualan.xlsx")
 
-# 5 Variabel yang diubah, urut. Key = kolom Excel, value = id wrapper React pada halaman.
+# 5 Variabel yang diubah, urut.
+# (kolom Excel, prefix id wrapper React, label, nama kolom remark manual)
 VARIABEL_MAP = [
-    ("nilai_penjualan", "nilai_pendapatan", "27.a Nilai penjualan barang dan jasa"),
-    ("biaya_pembelian", "biaya_pembelian", "27.b Biaya pembelian barang yang terjual"),
-    ("biaya_produksi", "biaya_produksi", "27.c Biaya produksi"),
-    ("biaya_operasional", "operasional", "27.d Biaya operasional"),
-    ("upah", "gaji", "26.a Upah/gaji"),
+    ("nilai_penjualan", "nilai_pendapatan", "27.a Nilai penjualan barang dan jasa", "remark_nilai_penjualan"),
+    ("biaya_pembelian", "biaya_pembelian", "27.b Biaya pembelian barang yang terjual", "remark_biaya_pembelian"),
+    ("biaya_produksi", "biaya_produksi", "27.c Biaya produksi", "remark_biaya_produksi"),
+    ("biaya_operasional", "operasional", "27.d Biaya operasional", "remark_biaya_operasional"),
+    ("upah", "gaji", "26.a Upah/gaji", "remark_upah"),
 ]
 
+REMARK_KEYS = [v[3] for v in VARIABEL_MAP]
+# Key timpa per variabel + KBLI + global
+TIMPA_KEYS = ["timpa_" + k for k in REMARK_KEYS] + ["timpa_remark_kbli", "timpa_remark"]
+
+# Alias nama header Excel yang diterima untuk kolom remark manual
+REMARK_ALIASES = {
+    "remark_nilai_penjualan": ["remark_nilai_penjualan", "catatan_nilai_penjualan", "komentar_nilai_penjualan"],
+    "remark_biaya_pembelian": ["remark_biaya_pembelian", "catatan_biaya_pembelian", "komentar_biaya_pembelian"],
+    "remark_biaya_produksi": ["remark_biaya_produksi", "catatan_biaya_produksi", "komentar_biaya_produksi"],
+    "remark_biaya_operasional": ["remark_biaya_operasional", "catatan_biaya_operasional", "komentar_biaya_operasional"],
+    "remark_upah": ["remark_upah", "catatan_upah", "remark_gaji", "catatan_gaji", "komentar_upah"],
+}
+
+# JS bersama: gulir window + semua container scroll satu langkah
+_SCROLL_STEP_JS = """(step) => {
+    window.scrollBy({ top: step, behavior: "instant" });
+    const scrollers = Array.from(document.querySelectorAll("div")).filter(el => {
+        const oy = getComputedStyle(el).overflowY;
+        return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 20;
+    });
+    scrollers.forEach(el => el.scrollBy({ top: step, behavior: "instant" }));
+}"""
+
+_HAS_MORE_SCROLL_JS = """(() => {
+    const scrollers = Array.from(document.querySelectorAll("div")).filter(el => {
+        const oy = getComputedStyle(el).overflowY;
+        return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 20;
+    });
+    return scrollers.some(el => el.scrollTop + el.clientHeight < el.scrollHeight - 5);
+})()"""
+
+_CLOSE_DIALOG_JS = """(() => {
+    const d = document.querySelector("[role='dialog']") || document.querySelector("[class*='max-w-lg']");
+    const scope = d || document;
+    const b = scope.querySelector("button[aria-label='Dismiss']") ||
+              Array.from(scope.querySelectorAll("button")).find(x => {
+                  const t = x.innerText.trim();
+                  return t === "Close" || t === "Batal";
+              });
+    if (b) { b.click(); return true; }
+    return false;
+})()"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilitas kecil
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_true(val) -> bool:
+    """True bila isi sel timpa bernilai 1 / true / ya / y (mendukung '1.0' dari Excel)."""
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    if s in ("1", "1.0", "true", "ya", "y", "yes"):
+        return True
+    return False
+
+
+def _fmt_cell(val) -> str:
+    """Ubah nilai sel Excel jadi string rapi. Float bulat (104160000.0) -> '104160000'."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, float) and val.is_integer():
+        return str(int(val))
+    return str(val).strip()
+
+
+def _normalize_num(val: Optional[str]) -> str:
+    """Normalisasi angka: buang pemisah ribuan/desimal & spasi untuk perbandingan."""
+    if val is None:
+        return ""
+    return str(val).strip().replace(".", "").replace(",", "").replace(" ", "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Excel sumber / progress / hasil
+# ─────────────────────────────────────────────────────────────────────────────
 
 def create_sample_source(file_path: Path = DEFAULT_SOURCE_FILE):
     """Membuat file Excel sumber contoh jika belum ada."""
@@ -85,6 +177,12 @@ def create_sample_source(file_path: Path = DEFAULT_SOURCE_FILE):
     ws.append([
         "link", "nama_usaha", "nilai_penjualan", "biaya_pembelian",
         "biaya_produksi", "biaya_operasional", "upah", "komentar",
+        "remark_nilai_penjualan", "remark_biaya_pembelian", "remark_biaya_produksi",
+        "remark_biaya_operasional", "remark_upah",
+        "timpa_remark",
+        "timpa_remark_nilai_penjualan", "timpa_remark_biaya_pembelian",
+        "timpa_remark_biaya_produksi", "timpa_remark_biaya_operasional",
+        "timpa_remark_upah", "timpa_remark_kbli",
     ])
     ws.append([
         config.DEFAULT_ASSIGNMENT_URL,
@@ -95,13 +193,17 @@ def create_sample_source(file_path: Path = DEFAULT_SOURCE_FILE):
         "4228000",
         "24000000",
         "#1",
+        "#1", "#1", "#1", "#1", "#1",
+        "0",
+        "", "", "", "", "", "",
     ])
     file_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(file_path)
     console.print(f"[bold green]✔ Contoh file sumber dibuat:[/bold green] [yellow]{file_path}[/yellow]")
     console.print(
-        "[dim]Kolom: link, nama_usaha, nilai_penjualan, biaya_pembelian, "
-        "biaya_produksi, biaya_operasional, upah, komentar. Satu baris per usaha.[/dim]"
+        "[dim]Kolom wajib: link, nama_usaha, nilai_penjualan, biaya_pembelian, "
+        "biaya_produksi, biaya_operasional, upah. Satu baris per usaha.\n"
+        "Opsional: remark_* (komentar manual), timpa_remark / timpa_remark_* (1 = timpa catatan lama).[/dim]"
     )
 
 
@@ -111,7 +213,7 @@ def load_progress() -> Dict[str, dict]:
 
     if PROGRESS_FILE.exists():
         try:
-            with open(PROGRESS_FILE, "r") as f:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
                 progress = json.load(f)
         except Exception:
             pass
@@ -152,6 +254,11 @@ def load_progress() -> Dict[str, dict]:
                 idx_str = get(c_no)
                 if not idx_str:
                     continue
+                # Nomor dari Excel bisa terbaca "1.0"
+                try:
+                    idx_str = str(int(float(idx_str)))
+                except ValueError:
+                    pass
                 status = get(c_status)
                 if idx_str not in progress and status:
                     progress[idx_str] = {
@@ -178,7 +285,7 @@ def save_progress(data: Dict[str, dict]):
     PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = PROGRESS_FILE.with_suffix(PROGRESS_FILE.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, PROGRESS_FILE)
@@ -220,7 +327,7 @@ def export_result_excel(tasks: List[dict], progress_data: Dict[str, dict], outpu
 
 
 def read_excel_source(file_path: Path) -> List[dict]:
-    """Membaca daftar usaha & nilai penjualan dari file Excel."""
+    """Membaca daftar usaha, nilai, remark manual, dan flag timpa dari file Excel."""
     if not file_path.exists():
         console.print(f"[bold red]❌ File sumber tidak ditemukan: {file_path}[/bold red]")
         console.print("[dim]Jalankan dulu: python update_penjualan.py --init-sample[/dim]")
@@ -229,38 +336,45 @@ def read_excel_source(file_path: Path) -> List[dict]:
     wb = openpyxl.load_workbook(file_path, data_only=True)
     sheet = wb.active
 
-    headers = [str(c).strip().lower() if c is not None else "" for c in next(sheet.iter_rows(values_only=True))]
+    headers = [
+        str(c).strip().lower() if c is not None else ""
+        for c in next(sheet.iter_rows(values_only=True))
+    ]
+
+    # Kolom "ekstra" (remark/catatan/timpa) tidak boleh ikut tertangkap oleh
+    # pencarian kolom data utama (mis. "nilai" jangan cocok ke "remark_nilai_penjualan").
+    EXTRA_PREFIXES = ("remark", "catatan", "timpa", "komentar_")
 
     def find_col(*keywords, fallback=None):
         for i, h in enumerate(headers):
+            if h.startswith(EXTRA_PREFIXES):
+                continue
             if all(k in h for k in keywords):
                 return i
         return fallback
 
+    def exact_col(*names):
+        for n in names:
+            if n in headers:
+                return headers.index(n)
+        return None
+
     link_col = find_col("link", fallback=0)
     nama_col = find_col("usaha", fallback=1)
     nilai_col = find_col("nilai", fallback=2)
-    komentar_col = find_col("komentar", fallback=3)
-    pembelian_col = find_col("pembelian", fallback=None)
-    produksi_col = find_col("produksi", fallback=None)
-    operasional_col = find_col("operasional", fallback=None)
-    upah_col = find_col("upah", fallback=None)
+    pembelian_col = find_col("pembelian")
+    produksi_col = find_col("produksi")
+    operasional_col = find_col("operasional")
+    upah_col = find_col("upah")
+    komentar_col = exact_col("komentar")
 
-    headers_str = " ".join(headers)
-    has_new = any(k in headers_str for k in ["pembelian", "produksi", "operasional", "upah"])
-
-    if not has_new:
-        # Old format: link, nama_usaha, nilai_penjualan, komentar
-        pembelian_col = None
-        produksi_col = None
-        operasional_col = None
-        upah_col = None
-        komentar_col = 3
+    remark_cols = {key: exact_col(*aliases) for key, aliases in REMARK_ALIASES.items()}
+    timpa_cols = {key: exact_col(key) for key in TIMPA_KEYS}
 
     def cell(row, col, default=""):
         if col is None or len(row) <= col or row[col] is None:
             return default
-        return str(row[col]).strip()
+        return _fmt_cell(row[col])
 
     tasks = []
     for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=1):
@@ -268,31 +382,39 @@ def read_excel_source(file_path: Path) -> List[dict]:
             continue
         link = str(row[link_col]).strip()
         nama_usaha = cell(row, nama_col)
-        nilai = cell(row, nilai_col)
-        pembelian = cell(row, pembelian_col)
-        produksi = cell(row, produksi_col)
-        operasional = cell(row, operasional_col)
-        upah = cell(row, upah_col)
-        komentar = cell(row, komentar_col) or "#1"
 
         if not nama_usaha:
             console.print(f"[dim yellow]↳ Baris #{row_idx} dilewati (nama_usaha kosong)[/dim yellow]")
             continue
 
-        tasks.append({
+        task = {
             "index": row_idx,
             "link": link,
             "nama_usaha": nama_usaha,
-            "nilai_penjualan": nilai,
-            "biaya_pembelian": pembelian,
-            "biaya_produksi": produksi,
-            "biaya_operasional": operasional,
-            "upah": upah,
-            "komentar": komentar,
-        })
+            "nilai_penjualan": cell(row, nilai_col),
+            "biaya_pembelian": cell(row, pembelian_col),
+            "biaya_produksi": cell(row, produksi_col),
+            "biaya_operasional": cell(row, operasional_col),
+            "upah": cell(row, upah_col),
+            "komentar": cell(row, komentar_col) or "#1",
+        }
+        for key, c in remark_cols.items():
+            task[key] = cell(row, c)
+        for key, c in timpa_cols.items():
+            task[key] = cell(row, c)
+        tasks.append(task)
 
     return tasks
 
+
+def build_remarks(item: dict) -> dict:
+    """Kumpulkan remark manual + flag timpa dari satu task menjadi satu dict."""
+    return {k: item.get(k) or "" for k in REMARK_KEYS + TIMPA_KEYS}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Login SSO
+# ─────────────────────────────────────────────────────────────────────────────
 
 def is_page_logged_out(page: Page) -> bool:
     """Mengecek apakah browser sedang berada pada status logout atau SSO."""
@@ -338,14 +460,16 @@ def perform_sso_login(page: Page, username: str = config.SSO_USERNAME, password:
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigasi & scroll
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _click_menuitem(page: Page, keyword: str) -> bool:
-    """
-    Mengklik item menu di sidebar (aside) berdasarkan keyword teks.
-    Mengembalikan True jika item ditemukan & diklik.
-    """
-    return page.evaluate(f"""(() => {{
-        const clean = (s) => (s || "").toLowerCase().replace(/\\s+/g, ' ').trim();
-        const target = clean("{keyword}");
+    """Mengklik item menu di sidebar (aside) berdasarkan keyword teks."""
+    return bool(page.evaluate(
+        r"""(keyword) => {
+        const clean = (s) => (s || "").toLowerCase().replace(/\s+/g, ' ').trim();
+        const target = clean(keyword);
         const aside = document.querySelector("aside");
         if (!aside) return false;
         const items = Array.from(aside.querySelectorAll("*")).filter(el =>
@@ -355,138 +479,55 @@ def _click_menuitem(page: Page, keyword: str) -> bool:
         if (!match) match = items.find(el => clean(el.textContent).includes(target));
         if (!match) return false;
         let clickable = match;
-        while (clickable && clickable !== aside && !clickable.onclick && !clickable.className.includes("cursor-pointer")) {{
+        while (clickable && clickable !== aside && !clickable.onclick && !String(clickable.className).includes("cursor-pointer")) {
             clickable = clickable.parentElement;
-        }}
-        (clickable || match).scrollIntoView({{ block: "center" }});
+        }
+        (clickable || match).scrollIntoView({ block: "center" });
         (clickable || match).click();
         return true;
-    }})()""")
+    }""",
+        keyword,
+    ))
 
 
-def _scroll_page(page: Page, direction: str = "down", amount: int = None):
+def _scroll_to_bottom_until(page: Page, script_find: str, step: int = 300, max_steps: int = 40, pause: float = 0.15) -> bool:
     """
-    Menggulir halaman secara bertahap.
-    direction: "down" | "up" | "top" | "bottom"
-    amount   : jarak gulir dalam piksel (default: 80% tinggi viewport)
+    Menggulir ke bawah bertahap sampai elemen (script_find truthy) ditemukan atau
+    sudah mentok di bawah. Mengembalikan True jika elemen ditemukan.
     """
-    page.evaluate(f"""(() => {{
-        const vh = window.innerHeight || 800;
-        if ("{direction}" === "top") {{ window.scrollTo({{ top: 0, behavior: "instant" }}); return; }}
-        if ("{direction}" === "bottom") {{ window.scrollTo({{ top: document.body.scrollHeight, behavior: "instant" }}); return; }}
-        const delta = {amount if amount is not None else 'Math.round(vh * 0.8)'} * ("{direction}" === "up" ? -1 : 1);
-        window.scrollBy({{ top: delta, behavior: "instant" }});
-    }})()""")
-
-
-def _scroll_until_visible(page: Page, script_find: str, max_scrolls: int = 15) -> bool:
-    """
-    Menggulir halaman dari atas ke bawah secara bertahap sampai elemen
-    (ditemukan oleh script_find yang mengembalikan truthy saat ketemu)
-    muncul di viewport. Mengembalikan True jika elemen ditemukan.
-    """
-    page.evaluate("window.scrollTo({ top: 0, behavior: 'instant' })")
-    for _ in range(max_scrolls):
+    for _ in range(max_steps):
         if page.evaluate(script_find):
             return True
         before = page.evaluate("window.scrollY")
-        _scroll_page(page, "down")
-        time.sleep(0.35)
+        page.evaluate(_SCROLL_STEP_JS, step)
+        time.sleep(pause)
         after = page.evaluate("window.scrollY")
-        if before == after:
+        more = page.evaluate(_HAS_MORE_SCROLL_JS)
+        if before == after and not more:
             break
     return bool(page.evaluate(script_find))
 
 
 def _scroll_to_bottom(page: Page, step: int = 300, max_steps: int = 40, pause: float = 0.15):
-    """
-    Menggulir window/layout ke paling bawah secara bertahap (step per step)
-    sampai tidak bisa turun lagi. Berguna agar konten dynamic ter-render.
-    """
-    for _ in range(max_steps):
-        before = page.evaluate("window.scrollY")
-        page.evaluate(
-            f"""(() => {{
-                window.scrollBy({{ top: {step}, behavior: "instant" }});
-                const scrollers = Array.from(document.querySelectorAll("div")).filter(el => {{
-                    const oy = getComputedStyle(el).overflowY;
-                    return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 20;
-                }});
-                scrollers.forEach(el => el.scrollBy({{ top: {step}, behavior: "instant" }}));
-            }})()"""
-        )
-        time.sleep(pause)
-        after = page.evaluate("window.scrollY")
-        more = page.evaluate(
-            """(() => {
-                const scrollers = Array.from(document.querySelectorAll("div")).filter(el => {
-                    const oy = getComputedStyle(el).overflowY;
-                    return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 20;
-                });
-                return scrollers.some(el => el.scrollTop + el.clientHeight < el.scrollHeight - 5);
-            })()"""
-        )
-        if before == after and not more:
-            break
-
-
-def _scroll_to_bottom_until(page: Page, script_find: str, step: int = 300, max_steps: int = 40, pause: float = 0.15) -> bool:
-    """
-    Menggulir ke bawah secara bertahap sampai elemen (script_find) ditemukan,
-    atau sampai sudah mentok di bawah. Mengembalikan True jika elemen ditemukan.
-    """
-    for _ in range(max_steps):
-        if page.evaluate(script_find):
-            return True
-        before = page.evaluate("window.scrollY")
-        page.evaluate(
-            f"""(() => {{
-                window.scrollBy({{ top: {step}, behavior: "instant" }});
-                const scrollers = Array.from(document.querySelectorAll("div")).filter(el => {{
-                    const oy = getComputedStyle(el).overflowY;
-                    return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 20;
-                }});
-                scrollers.forEach(el => el.scrollBy({{ top: {step}, behavior: "instant" }}));
-            }})()"""
-        )
-        time.sleep(pause)
-        after = page.evaluate("window.scrollY")
-        more = page.evaluate(
-            """(() => {
-                const scrollers = Array.from(document.querySelectorAll("div")).filter(el => {
-                    const oy = getComputedStyle(el).overflowY;
-                    return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 20;
-                });
-                return scrollers.some(el => el.scrollTop + el.clientHeight < el.scrollHeight - 5);
-            })()"""
-        )
-        if before == after and not more:
-            break
-    return bool(page.evaluate(script_find))
+    """Menggulir window/layout ke paling bawah bertahap agar konten dinamis ter-render."""
+    _scroll_to_bottom_until(page, "false", step=step, max_steps=max_steps, pause=pause)
 
 
 def _click_usaha_item(page: Page, nama_usaha: str) -> bool:
     """
     Membuka rincian sub-blok usaha pada section KETERANGAN USAHA/PERUSAHAAN.
-    Nama usaha berformat "NAMA USAHA [NAMA PEMILIK]".
-
-    Ada 2 tahap:
-      1. Klik nama usaha pada daftar kartu (di content area, bukan aside).
-      2. Setelah rincian terbuka, form akan memuat textfield-textfield usaha.
-    Menggulir ke bawah sampai sub-blok usaha ditemukan.
+    Mencari kartu nama usaha di content area (bukan aside) lalu mengkliknya.
     """
-    target_js = nama_usaha.replace("\\", "\\\\").replace('"', '\\"')
+    target_js = json.dumps(nama_usaha)
 
     def make_script(do_click: bool) -> str:
         click_line = (
-            'match.scrollIntoView({ block: "center" });'
-            'match.click();'
-            'return true;'
-        ) if do_click else 'return true;'
+            'match.scrollIntoView({ block: "center" }); match.click(); return true;'
+            if do_click else "return true;"
+        )
         return f"""(() => {{
         const clean = (s) => (s || "").toLowerCase().replace(/\\s+/g, ' ').trim();
-        const target = clean("{target_js}");
-        // Cari elemen kartu nama usaha di content area (bukan sidebar)
+        const target = clean({target_js});
         const nodes = Array.from(document.querySelectorAll("body *")).filter(el =>
             el.children.length === 0 && clean(el.textContent) === target
         );
@@ -495,7 +536,6 @@ def _click_usaha_item(page: Page, nama_usaha: str) -> bool:
         {click_line}
     }})()"""
 
-    # Scroll dulu window sampai bawah agar daftar usaha ter-render, lalu cari & klik
     _scroll_to_bottom(page)
     if not _scroll_to_bottom_until(page, make_script(do_click=False)):
         return False
@@ -505,64 +545,18 @@ def _click_usaha_item(page: Page, nama_usaha: str) -> bool:
     return ok
 
 
-def _find_penjualan_input(page: Page):
-    """
-    Mencari input nilai penjualan (rincian "27. a. Nilai penjualan barang dan jasa").
-    Strategi: cari label pertanyaan, lalu telusuri ke atas ke wrapper yang memiliki
-    input textfield-cl-* di dalamnya.
-    Mengembalikan (input_id, old_value) atau (None, None).
-    """
-    find_script = """(() => {
-        const labels = Array.from(document.querySelectorAll("body *")).filter(el =>
-            el.children.length === 0 && /Nilai penjualan barang dan jasa/i.test(el.textContent)
-        );
-        if (!labels.length) return false;
-        const lb = labels[0];
-        let p = lb;
-        for (let i = 0; i < 8 && p; i++) {
-            const inp = p.querySelector("input[id*='textfield-cl-'], textarea[id*='textfield-cl-']");
-            if (inp) return true;
-            p = p.parentElement;
-        }
-        return false;
-    })()"""
-
-    _scroll_to_bottom_until(page, find_script)
-
-    res = page.evaluate("""(() => {
-        const labels = Array.from(document.querySelectorAll("body *")).filter(el =>
-            el.children.length === 0 && /Nilai penjualan barang dan jasa/i.test(el.textContent)
-        );
-        let lb = labels[0];
-        // Fallback: cari input numerik dengan konteks penjualan jika label khusus tak ada
-        if (!lb) {
-            const inputs = Array.from(document.querySelectorAll("input[id*='textfield-cl-']"));
-            const inp = inputs.find(i => /penjualan|pendapatan|omzet/i.test(
-                (i.closest("div") ? i.closest("div").innerText : "") + i.id));
-            return inp ? { id: inp.id, value: inp.value } : null;
-        }
-        let p = lb;
-        for (let i = 0; i < 8 && p; i++) {
-            const inp = p.querySelector("input[id*='textfield-cl-'], textarea[id*='textfield-cl-']");
-            if (inp) return { id: inp.id, value: inp.value };
-            p = p.parentElement;
-        }
-        return null;
-    })()""")
-    if not res or not res.get("id"):
-        return None, None
-    return res["id"], res["value"]
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Submit
+# ─────────────────────────────────────────────────────────────────────────────
 
 def submit_assignment(page: Page) -> Tuple[bool, str]:
     """
-    Melakukan proses submit kuesioner (sama seperti cleaning_nik.py):
-    1. Masuk ke section CATATAN
-    2. Cek switch "Tampilkan Anomali Usaha dan Keluarga" (aktifkan jika belum)
+    Proses submit kuesioner:
+    1. Masuk section CATATAN
+    2. Aktifkan switch "Tampilkan Anomali Usaha dan Keluarga" (jika belum)
     3. Pastikan switch "Anomali diselesaikan oleh admin" tidak aktif
-    4. Klik Kirim utama -> Cek validasi 0 Galat -> Klik Kirim modal -> Konfirmasi final
+    4. Klik Kirim utama -> cek 0 Galat -> Kirim modal -> Konfirmasi final
     """
-    # 1. Masuk ke section CATATAN
     click_catatan_ok = page.evaluate("""(() => {
         const aside = document.querySelector("aside");
         if (!aside) return false;
@@ -570,10 +564,10 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
         if (elements.length === 0) return false;
         const target = elements[0];
         let clickable = target;
-        while (clickable && clickable !== aside && !clickable.onclick && !clickable.className.includes("cursor-pointer")) {
+        while (clickable && clickable !== aside && !clickable.onclick && !String(clickable.className).includes("cursor-pointer")) {
             clickable = clickable.parentElement;
         }
-        clickable.scrollIntoView({ block: "center" });
+        (clickable || target).scrollIntoView({ block: "center" });
         (clickable || target).click();
         return true;
     })()""")
@@ -583,14 +577,9 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
 
     time.sleep(1.5)
 
-    # 2. Cek switch di blok CATATAN:
-    # - "Tampilkan Anomali Usaha dan Keluarga" jika sudah dichecklist JANGAN dichecklist lagi.
-    # - JANGAN checklist "Anomali diselesaikan oleh admin".
-    # - JANGAN memberi catatan penjelasan anomali admin.
     page.evaluate("""(() => {
         const rows = Array.from(document.querySelectorAll("div[class*='rounded-lg'], div[class*='gap-2'], div[class*='flex'], label"));
 
-        // Cari switch "Tampilkan Anomali Usaha dan Keluarga" (hindari baris admin)
         const anomaliRow = rows.find(r => {
             const t = (r.innerText || "").toLowerCase();
             return t.includes("tampilkan anomali") && !t.includes("admin");
@@ -609,7 +598,6 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
             }
         }
 
-        // Pastikan switch "Anomali diselesaikan oleh admin" TIDAK DICHECKLIST (jika sempat aktif, uncheck)
         const adminRow = rows.find(r => {
             const t = (r.innerText || "").toLowerCase();
             return t.includes("anomali diselesaikan oleh admin");
@@ -630,9 +618,8 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
 
     time.sleep(1.0)
 
-    # 3. Klik tombol Kirim utama (ulangi bila modal validasi belum muncul)
     modal_opened = False
-    for attempt in range(3):
+    for _ in range(3):
         page.evaluate("""(() => {
             const btns = Array.from(document.querySelectorAll("button")).filter(b => b.innerText.trim() === "Kirim" && b.offsetWidth > 0);
             const btn = btns[btns.length - 1];
@@ -653,7 +640,6 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
 
     time.sleep(1.0)
 
-    # 4. Validasi 0 Galat & Klik Kirim di modal
     val_res = page.evaluate("""(() => {
         const modal = document.querySelector("[class*='max-w-lg'], [role='dialog']");
         if (!modal) return { status: "ERR", msg: "Modal validasi tidak ditemukan" };
@@ -675,14 +661,12 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
     if val_res.get("status") != "OK":
         return False, f"Validasi gagal: {val_res.get('msg')}"
 
-    # 5. Klik tombol Konfirmasi pada dialog akhir
     try:
         page.wait_for_selector("button:has-text('Konfirmasi')", timeout=10000)
         page.locator("button:has-text('Konfirmasi')").first.click()
     except Exception:
         return False, "Tombol 'Konfirmasi' dialog akhir tidak ditemukan"
 
-    # 6. Verifikasi submit selesai
     try:
         page.wait_for_function("""() => {
             const t = document.body ? document.body.innerText : "";
@@ -693,25 +677,19 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
         return False, "Status sukses submit tidak terdeteksi pada layar"
 
 
-def _normalize_num(val: str) -> str:
-    """Normalisasi angka: buang pemisah ribuan/desimal & spasi untuk perbandingan."""
-    if val is None:
-        return ""
-    s = str(val).strip()
-    s = s.replace(".", "").replace(",", "").replace(" ", "")
-    return s
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Wrapper, catatan, dan pengisian field
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _find_wrapper_js(prefix: str, need_input: bool = True) -> str:
     """
-    Membangun JS untuk mencari wrapper React berdasarkan PREFIX id (bukan id exact),
-    karena suffix id dinamis (mis. '#1', '#1101') dan bisa ada varian '_bln'.
-    Mengembalikan objek {wrapper, input} atau null.
+    JS untuk mencari wrapper React berdasarkan PREFIX id (suffix dinamis, mis. '#1',
+    '#1101', dan varian '_bln'). Mengembalikan {wrapper, input} atau null.
     """
-    prefix_js = prefix.replace("\\", "\\\\").replace('"', '\\"')
+    prefix_js = json.dumps(prefix)
     input_req = "true" if need_input else "false"
     return f"""(() => {{
-        const els = Array.from(document.querySelectorAll('[id^="{prefix_js}"]'));
+        const els = Array.from(document.querySelectorAll('[id^=' + JSON.stringify({prefix_js}) + ']'));
         const withInput = els.filter(w => w.querySelector("input[id*='textfield-cl-']"));
         let chosen = null;
         if ({input_req}) {{
@@ -753,211 +731,223 @@ def _expand_pengeluaran(page: Page) -> bool:
         return False
 
 
-def _set_nilai_field(page: Page, wrapper_id: str, value: str, komentar_value: str, label: str) -> Tuple[bool, str]:
+def _close_dialog(page: Page):
+    """Tutup dialog catatan (tunggu hilang, kalau tidak klik tombol close)."""
+    try:
+        page.wait_for_selector("[role='dialog']", state="hidden", timeout=3000)
+    except Exception:
+        page.evaluate(_CLOSE_DIALOG_JS)
+        time.sleep(0.4)
+
+
+def _write_catatan(page: Page, wrapper_exact: str, kom_to_fill: str, label: str, timpa: bool) -> Tuple[bool, str]:
     """
-    Mengisi satu field nilai via PREFIX wrapper (mis. 'nilai_pendapatan') + catatannya.
-    Mendukung suffix dinamis maupun varian bulanan ('_bln').
-    Komentar otomatis: '#1' jika nilai berubah, '#0' jika sama/tidak berubah.
+    Membuka dialog Catatan pada wrapper tertentu lalu:
+      - membaca isi catatan lama langsung dari textarea,
+      - jika sudah ada #0/#1 dan timpa=False  -> biarkan (tutup dialog),
+      - jika sama persis dengan yang akan diisi -> biarkan,
+      - selain itu isi/timpa dengan kom_to_fill lalu klik Simpan.
+    Return (ok, status) dengan status: 'SAVED' | 'KEPT' | 'SAME' | pesan error.
+    """
+    wid = json.dumps(wrapper_exact)
+
+    visible_btn_js = f"""(() => {{
+        const w = document.getElementById({wid});
+        if (!w) return false;
+        return Array.from(w.querySelectorAll("button[title='Catatan'], button[aria-label='Catatan']"))
+            .some(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+    }})()"""
+    click_btn_js = f"""(() => {{
+        const w = document.getElementById({wid});
+        if (!w) return false;
+        const btns = Array.from(w.querySelectorAll("button[title='Catatan'], button[aria-label='Catatan']"));
+        const b = btns.find(x => x.offsetWidth > 0 && x.offsetHeight > 0) || btns[0];
+        if (!b) return false;
+        b.scrollIntoView({{ block: "center" }});
+        b.click();
+        return true;
+    }})()"""
+
+    _scroll_to_bottom_until(page, visible_btn_js)
+    if not page.evaluate(click_btn_js):
+        return False, f"Tombol Catatan '{label}' tidak ditemukan"
+
+    try:
+        page.wait_for_selector("textarea[placeholder*='catatan' i]", timeout=8000)
+    except Exception:
+        return False, f"Dialog catatan '{label}' tidak muncul"
+
+    existing = (page.evaluate("""(() => {
+        const ta = document.querySelector("textarea[placeholder*='catatan' i]");
+        return ta ? (ta.value || "") : "";
+    })()""") or "").strip()
+
+    has_flag = "#0" in existing or "#1" in existing
+
+    if existing == kom_to_fill:
+        page.evaluate(_CLOSE_DIALOG_JS)
+        _close_dialog(page)
+        return True, "SAME"
+
+    if has_flag and not timpa:
+        page.evaluate(_CLOSE_DIALOG_JS)
+        _close_dialog(page)
+        return True, f"KEPT:{existing}"
+
+    # Isi / timpa catatan
+    res = page.evaluate(
+        """(val) => {
+            const ta = document.querySelector("textarea[placeholder*='catatan' i]");
+            if (!ta) return "ERR";
+            ta.focus();
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+            setter.call(ta, val);
+            ta.dispatchEvent(new Event("input", { bubbles: true }));
+            ta.dispatchEvent(new Event("change", { bubbles: true }));
+            return ta.value;
+        }""",
+        kom_to_fill,
+    )
+    if res != kom_to_fill:
+        page.evaluate(_CLOSE_DIALOG_JS)
+        _close_dialog(page)
+        return False, f"Gagal mengisi textarea catatan '{label}'"
+
+    time.sleep(0.3)
+    saved = page.evaluate("""(() => {
+        const b = document.querySelector("button[title='Simpan']") ||
+                  Array.from(document.querySelectorAll("button")).find(x => x.innerText.trim() === "Simpan");
+        if (!b) return false;
+        b.click();
+        return true;
+    })()""")
+    if not saved:
+        page.evaluate(_CLOSE_DIALOG_JS)
+        _close_dialog(page)
+        return False, f"Tombol Simpan catatan '{label}' tidak ditemukan"
+
+    time.sleep(0.6)
+    # Tutup dialog bila masih terbuka setelah Simpan
+    page.evaluate(_CLOSE_DIALOG_JS)
+    _close_dialog(page)
+    time.sleep(0.4)
+    return True, "SAVED"
+
+
+def _set_nilai_field(
+    page: Page,
+    wrapper_prefix: str,
+    value: str,
+    label: str,
+    komentar_manual: str = "",
+    timpa: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Mengisi satu field nilai via PREFIX wrapper + catatannya.
+    Komentar:
+      - komentar_manual (kolom remark_* di Excel) dipakai bila terisi,
+      - jika kosong: '#1' bila nilai berubah, '#0' bila sama/kosong.
+    Catatan lama (#0/#1) dipertahankan kecuali timpa=True.
     """
     if value is None or str(value).strip() == "":
         console.print(f"   [dim]↳ {label}: dilewati (nilai kosong)[/dim]")
         return True, "dilewati"
 
     # 1) Cari wrapper + input via prefix
-    found = _find_wrapper(page, wrapper_id, need_input=True)
+    found = _find_wrapper(page, wrapper_prefix, need_input=True)
     if not found or not found.get("input"):
-        # Field upah/gaji kadang berada di section Pengeluaran yang belum terbuka
-        _expand_pengeluaran(page)
+        _expand_pengeluaran(page)  # upah/gaji kadang di section Pengeluaran yang tertutup
         time.sleep(0.8)
-        found = _find_wrapper(page, wrapper_id, need_input=True)
+        found = _find_wrapper(page, wrapper_prefix, need_input=True)
     if not found or not found.get("input"):
-        return False, f"TextField '{label}' (prefix {wrapper_id}) tidak ditemukan"
+        return False, f"TextField '{label}' (prefix {wrapper_prefix}) tidak ditemukan"
     wrapper_exact = found["wrapper"]
     input_id = found["input"]
-    wrapper_id_js = wrapper_exact.replace("\\", "\\\\").replace('"', '\\"')
 
-    # 2) Scroll ke tengah viewport & isi nilai (force=True karena React re-render)
+    # 2) Isi nilai
     try:
-        page.evaluate("(iid) => { const e = document.getElementById(iid); if (e) e.scrollIntoView({ block: 'center' }); }", input_id)
+        page.evaluate(
+            "(iid) => { const e = document.getElementById(iid); if (e) e.scrollIntoView({ block: 'center' }); }",
+            input_id,
+        )
         time.sleep(0.6)
-        inp = page.locator(f"#{input_id}")
+        inp = page.locator(f'[id="{input_id}"]')
         old_value = inp.input_value(timeout=5000)
         inp.fill(str(value), force=True, timeout=15000)
-        inp.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); el.blur(); }")
+        inp.evaluate(
+            "el => { el.dispatchEvent(new Event('input', {bubbles:true})); "
+            "el.dispatchEvent(new Event('change', {bubbles:true})); el.blur(); }"
+        )
     except Exception as e:
         return False, f"Gagal mengisi '{label}': {e}"
 
     console.print(f"   [dim]↳ {label}: '{old_value or '-'}' -> '{value}' (field {input_id}, wrapper {wrapper_exact})[/dim]")
     time.sleep(0.6)
 
-    # Tentukan komentar: '#1' jika nilai berubah, '#0' jika sama
-    old_norm = _normalize_num(old_value)
-    new_norm = _normalize_num(value)
-    kom_to_fill = "#0" if (old_norm == new_norm or old_norm == "" or new_norm == "") else "#1"
-    console.print(f"   [dim]↳ Komentar {label}: {kom_to_fill} (asal='{old_value}', baru='{value}')[/dim]")
-
-    # 3) Catatan pada field ini (scope = wrapper exact yang sudah ditemukan)
-    catatan_click_js = f"""(() => {{
-        const w = document.querySelector('[id="{wrapper_id_js}"]');
-        if (!w) return false;
-        const btns = Array.from(w.querySelectorAll("button[title='Catatan'], button[aria-label='Catatan']"));
-        const visibleBtn = btns.find(b => b.offsetWidth > 0 && b.offsetHeight > 0) || btns[0];
-        if (!visibleBtn) return false;
-        visibleBtn.scrollIntoView({{ behavior: "smooth", block: "center" }});
-        visibleBtn.click();
-        return true;
-    }})()"""
-    catatan_found_js = f"""(() => {{
-        const w = document.querySelector('[id="{wrapper_id_js}"]');
-        if (!w) return false;
-        return Array.from(w.querySelectorAll("button[title='Catatan'], button[aria-label='Catatan']"))
-            .some(b => b.offsetWidth > 0 && b.offsetHeight > 0);
-    }})()"""
-
-    _scroll_to_bottom_until(page, catatan_found_js)
-    catatan_clicked = page.evaluate(catatan_click_js)
-
-    if catatan_clicked:
-        try:
-            page.wait_for_selector("textarea[placeholder*='catatan' i]", timeout=8000)
-            page.evaluate(f"""(() => {{
-                const ta = document.querySelector("textarea[placeholder*='catatan' i]");
-                if (!ta) return "ERR";
-                const dialog = ta.closest("[role='dialog']") || document.querySelector("[class*='max-w-lg']");
-                const valToFill = "{kom_to_fill}";
-                if (dialog && dialog.innerText.includes(valToFill)) {{
-                    const closeBtn = dialog.querySelector("button[aria-label='Dismiss']") ||
-                                     Array.from(dialog.querySelectorAll("button")).find(b => b.innerText.trim() === "Close" || b.innerText.trim() === "Batal");
-                    if (closeBtn) closeBtn.click();
-                    return "ALREADY";
-                }}
-                ta.focus();
-                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-                nativeSetter.call(ta, valToFill);
-                ta.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                ta.dispatchEvent(new Event("change", {{ bubbles: true }}));
-                const saveBtn = document.querySelector("button[title='Simpan']");
-                if (saveBtn) saveBtn.click();
-                setTimeout(() => {{
-                    const closeBtn = document.querySelector("button[aria-label='Dismiss']") ||
-                                     Array.from(document.querySelectorAll("button")).find(b => b.innerText.trim() === "Close" || b.innerText.trim() === "Batal");
-                    if (closeBtn) closeBtn.click();
-                }}, 500);
-                return "SAVED";
-            }})()""")
-            try:
-                page.wait_for_selector("[role='dialog']", state="hidden", timeout=3000)
-            except Exception:
-                page.evaluate("""(() => {
-                    const d = document.querySelector("[role='dialog']");
-                    if (d) {
-                        const b = d.querySelector("button[aria-label='Dismiss']") ||
-                                  Array.from(d.querySelectorAll("button")).find(x => x.innerText.trim() === 'Close' || x.innerText.trim() === 'Batal');
-                        if (b) b.click();
-                    }
-                })()""")
-            time.sleep(0.5)
-        except Exception:
-            console.print(f"   [dim yellow]⚠ Dialog catatan '{label}' tidak muncul, lanjut tanpa komentar[/dim yellow]")
+    # 3) Tentukan komentar
+    manual = str(komentar_manual).strip() if komentar_manual is not None else ""
+    if manual:
+        kom_to_fill = manual
+        src = "manual dari Excel"
     else:
-        console.print(f"   [dim yellow]⚠ Tombol Catatan '{label}' tidak ditemukan[/dim yellow]")
+        old_norm = _normalize_num(old_value)
+        new_norm = _normalize_num(value)
+        kom_to_fill = "#0" if (old_norm == new_norm or old_norm == "" or new_norm == "") else "#1"
+        src = f"otomatis, asal='{old_value}', baru='{value}'"
 
-    time.sleep(0.4)
+    # 4) Tulis catatan (baca catatan lama dari dialog, hormati flag timpa)
+    ok, status = _write_catatan(page, wrapper_exact, kom_to_fill, label, timpa)
+    if not ok:
+        console.print(f"   [dim yellow]⚠ {status}, lanjut tanpa komentar[/dim yellow]")
+        return True, "ok"
+
+    if status == "SAVED":
+        tag = "ditimpa" if timpa else "disimpan"
+        console.print(f"   [dim]↳ Komentar {label}: {kom_to_fill} ({src}) → {tag}[/dim]")
+    elif status == "SAME":
+        console.print(f"   [dim]↳ Komentar {label}: {kom_to_fill} (sudah sama, tidak diubah)[/dim]")
+    elif status.startswith("KEPT"):
+        console.print(
+            f"   [dim]↳ Komentar {label}: catatan lama '{status[5:]}' dipertahankan "
+            f"(timpa_remark bukan 1)[/dim]"
+        )
     return True, "ok"
 
 
-def _set_catatan_only(page: Page, wrapper_prefix: str, komentar_value: str, label: str = "Catatan") -> Tuple[bool, str]:
+def _set_catatan_only(
+    page: Page,
+    wrapper_prefix: str,
+    komentar_value: str,
+    label: str = "Catatan",
+    timpa: bool = True,
+) -> Tuple[bool, str]:
     """
-    Hanya menambahkan/mengisi catatan pada wrapper tertentu (tanpa mengubah nilai input).
-    Menerima PREFIX id (mis. 'kbli#'). Khusus KBLI: default #0 karena tidak mengubah nilai.
+    Hanya mengisi catatan pada wrapper tertentu (tanpa mengubah nilai input).
+    Menerima PREFIX id (mis. 'kbli#'). Default '#0' karena nilai tidak diubah.
     """
-    if komentar_value is None or str(komentar_value).strip() == "":
-        komentar_value = "#0"
-    kom_to_fill = str(komentar_value).strip()
+    kom_to_fill = str(komentar_value or "").strip()
     if kom_to_fill not in ("#0", "#1"):
-        # default untuk catatan tanpa ubah nilai
         kom_to_fill = "#0"
 
-    # Cari wrapper KBLI (tanpa perlu input) via prefix
     found = _find_wrapper(page, wrapper_prefix, need_input=False)
     if not found:
-        console.print(f"   [dim yellow]⚠ Tombol Catatan '{label}' (prefix {wrapper_prefix}) tidak ditemukan[/dim yellow]")
-        return False, f"Tombol Catatan {label} tidak ditemukan"
+        console.print(f"   [dim yellow]⚠ Wrapper '{label}' (prefix {wrapper_prefix}) tidak ditemukan[/dim yellow]")
+        return False, f"Wrapper {label} tidak ditemukan"
     wrapper_exact = found["wrapper"]
-    wrapper_id_js = wrapper_exact.replace("\\", "\\\\").replace('"', '\\"')
 
-    catatan_found_js = f"""(() => {{
-        const w = document.querySelector('[id="{wrapper_id_js}"]');
-        if (!w) return false;
-        return Array.from(w.querySelectorAll("button[title='Catatan'], button[aria-label='Catatan']"))
-            .some(b => b.offsetWidth > 0 && b.offsetHeight > 0);
-    }})()"""
+    ok, status = _write_catatan(page, wrapper_exact, kom_to_fill, label, timpa)
+    if not ok:
+        console.print(f"   [dim yellow]⚠ {status}[/dim yellow]")
+        return False, status
 
-    catatan_click_js = f"""(() => {{
-        const w = document.querySelector('[id="{wrapper_id_js}"]');
-        if (!w) return false;
-        const btns = Array.from(w.querySelectorAll("button[title='Catatan'], button[aria-label='Catatan']"));
-        const visibleBtn = btns.find(b => b.offsetWidth > 0 && b.offsetHeight > 0) || btns[0];
-        if (!visibleBtn) return false;
-        visibleBtn.scrollIntoView({{ behavior: "smooth", block: "center" }});
-        visibleBtn.click();
-        return true;
-    }})()"""
-
-    _scroll_to_bottom_until(page, catatan_found_js)
-    catatan_clicked = page.evaluate(catatan_click_js)
-
-    if not catatan_clicked:
-        console.print(f"   [dim yellow]⚠ Tombol Catatan '{label}' ({wrapper_exact}) tidak ditemukan[/dim yellow]")
-        return False, f"Tombol Catatan {label} tidak ditemukan"
-
-    try:
-        page.wait_for_selector("textarea[placeholder*='catatan' i]", timeout=8000)
-        page.evaluate(f"""(() => {{
-            const ta = document.querySelector("textarea[placeholder*='catatan' i]");
-            if (!ta) return "ERR";
-            const dialog = ta.closest("[role='dialog']") || document.querySelector("[class*='max-w-lg']");
-            const valToFill = "{kom_to_fill}";
-            if (dialog && dialog.innerText.includes(valToFill)) {{
-                const closeBtn = dialog.querySelector("button[aria-label='Dismiss']") ||
-                                 Array.from(dialog.querySelectorAll("button")).find(b => b.innerText.trim() === "Close" || b.innerText.trim() === "Batal");
-                if (closeBtn) closeBtn.click();
-                return "ALREADY";
-            }}
-            ta.focus();
-            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
-            nativeSetter.call(ta, valToFill);
-            ta.dispatchEvent(new Event("input", {{ bubbles: true }}));
-            ta.dispatchEvent(new Event("change", {{ bubbles: true }}));
-            const saveBtn = document.querySelector("button[title='Simpan']");
-            if (saveBtn) saveBtn.click();
-            setTimeout(() => {{
-                const closeBtn = document.querySelector("button[aria-label='Dismiss']") ||
-                                 Array.from(document.querySelectorAll("button")).find(b => b.innerText.trim() === "Close" || b.innerText.trim() === "Batal");
-                if (closeBtn) closeBtn.click();
-            }}, 500);
-            return "SAVED";
-        }})()""")
-        try:
-            page.wait_for_selector("[role='dialog']", state="hidden", timeout=3000)
-        except Exception:
-            page.evaluate("""(() => {
-                const d = document.querySelector("[role='dialog']");
-                if (d) {
-                    const b = d.querySelector("button[aria-label='Dismiss']") ||
-                              Array.from(d.querySelectorAll("button")).find(x => x.innerText.trim() === 'Close' || x.innerText.trim() === 'Batal');
-                    if (b) b.click();
-                }
-            })()""")
-        time.sleep(0.5)
-    except Exception:
-        console.print(f"   [dim yellow]⚠ Dialog catatan '{label}' tidak muncul, lanjut tanpa komentar[/dim yellow]")
-        return False, f"Dialog catatan {label} tidak muncul"
-
-    console.print(f"   [dim]↳ Catatan {label} ({wrapper_exact}): '{kom_to_fill}'[/dim]")
+    console.print(f"   [dim]↳ Catatan {label} ({wrapper_exact}): '{kom_to_fill}' [{status}][/dim]")
     time.sleep(0.4)
     return True, "ok"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alur per baris
+# ─────────────────────────────────────────────────────────────────────────────
 
 def update_penjualan_row(
     page: Page,
@@ -972,17 +962,21 @@ def update_penjualan_row(
     kbli_catatan: str = "#0",
     kbli_wrapper_id: str = "kbli#",
     retry_on_logout: bool = True,
+    remarks: Optional[dict] = None,
 ) -> Tuple[bool, str]:
     """
-    Menjalankan alur update 5 variabel nilai & komentar untuk satu usaha:
+    Alur update 5 variabel nilai & komentar untuk satu usaha:
     1. Buka kuesioner (mode edit).
     2. Masuk section KETERANGAN USAHA/PERUSAHAAN, pilih sub-blok usaha.
-    3. Untuk tiap variabel (27.a nilai penjualan, 27.b biaya pembelian,
-       27.c biaya produksi, 27.d biaya operasional, 26.a upah/gaji):
-       isi nilai + catatan.
+    3. Isi tiap variabel + catatan (komentar manual / otomatis, timpa sesuai flag).
     4. Tambah catatan KBLI.
-    5. Submit assignment (CATATAN -> switch anomali -> Kirim -> Konfirmasi).
+    5. Submit assignment.
+
+    remarks: dict berisi remark_* (komentar manual) dan timpa_* (flag timpa).
     """
+    if remarks is None:
+        remarks = {}
+
     edit_url = link.strip()
     if not edit_url.endswith("/edit"):
         edit_url = edit_url.rstrip("/") + "/edit"
@@ -995,6 +989,13 @@ def update_penjualan_row(
         "upah": upah,
     }
 
+    def _retry():
+        return update_penjualan_row(
+            page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi,
+            biaya_operasional, upah, komentar_value, kbli_catatan, kbli_wrapper_id,
+            retry_on_logout=False, remarks=remarks,
+        )
+
     try:
         page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
@@ -1004,7 +1005,7 @@ def update_penjualan_row(
 
     if is_page_logged_out(page):
         if retry_on_logout and perform_sso_login(page):
-            return update_penjualan_row(page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi, biaya_operasional, upah, komentar_value, kbli_catatan, kbli_wrapper_id, retry_on_logout=False)
+            return _retry()
         return False, "Sesi login habis / terlogout"
 
     try:
@@ -1012,47 +1013,68 @@ def update_penjualan_row(
     except Exception:
         if is_page_logged_out(page) and retry_on_logout:
             if perform_sso_login(page):
-                return update_penjualan_row(page, link, nama_usaha, nilai_penjualan, biaya_pembelian, biaya_produksi, biaya_operasional, upah, komentar_value, kbli_catatan, kbli_wrapper_id, retry_on_logout=False)
+                return _retry()
         return False, "Menu sidebar (aside) kuesioner tidak muncul"
 
     time.sleep(1.0)
 
-    # 1. Masuk section "KETERANGAN USAHA/PERUSAHAAN"
+    # 1. Section "KETERANGAN USAHA/PERUSAHAAN"
     if not _click_menuitem(page, "keterangan usaha/perusahaan"):
         if not _click_menuitem(page, "keterangan usaha"):
             return False, "Section 'KETERANGAN USAHA/PERUSAHAAN' tidak ditemukan di sidebar"
     time.sleep(1.5)
 
-    # 2. Pilih sub-blok usaha
+    # 2. Sub-blok usaha
     if not _click_usaha_item(page, nama_usaha):
         return False, f"Sub-blok usaha '{nama_usaha}' tidak ditemukan"
     time.sleep(1.5)
 
-    # 3. Isi 5 Variabel (urut) + catatan
-    for col_key, wrapper_id, label in VARIABEL_MAP:
-        ok, detail = _set_nilai_field(page, wrapper_id, values.get(col_key, ""), komentar_value, label)
+    # 3. Isi 5 variabel (urut) + catatan
+    timpa_global = _is_true(remarks.get("timpa_remark"))
+    for col_key, wrapper_prefix, label, remark_key in VARIABEL_MAP:
+        per_var = remarks.get("timpa_" + remark_key, "")
+        # Prioritas: kolom per variabel (jika terisi, 0 pun dihormati) > kolom global
+        if str(per_var).strip() != "":
+            timpa = _is_true(per_var)
+        else:
+            timpa = timpa_global
+        ok, detail = _set_nilai_field(
+            page, wrapper_prefix, values.get(col_key, ""), label,
+            komentar_manual=remarks.get(remark_key, ""), timpa=timpa,
+        )
         if not ok:
             return False, detail
 
-    # 4. Tambah catatan KBLI (fallback ke varian kbli_genai bila kbli# tidak ada)
+    # 4. Catatan KBLI (fallback ke kbli_genai bila kbli# tidak ada)
     if kbli_catatan and kbli_catatan.strip():
+        per_kbli = remarks.get("timpa_remark_kbli", "")
+        # Default KBLI: selalu isi/timpa (perilaku lama), kecuali kolom timpa_remark_kbli = 0
+        timpa_kbli = _is_true(per_kbli) if str(per_kbli).strip() != "" else True
+
         _scroll_to_bottom(page)
         time.sleep(0.5)
-        ok_kbli, det_kbli = _set_catatan_only(page, kbli_wrapper_id, kbli_catatan, "KBLI")
+        ok_kbli, det_kbli = _set_catatan_only(page, kbli_wrapper_id, kbli_catatan, "KBLI", timpa_kbli)
         if not ok_kbli:
-            ok_kbli, det_kbli = _set_catatan_only(page, "kbli_genai#", kbli_catatan, "KBLI")
+            ok_kbli, det_kbli = _set_catatan_only(page, "kbli_genai#", kbli_catatan, "KBLI", timpa_kbli)
         if not ok_kbli:
             console.print(f"   [dim yellow]⚠ Catatan KBLI gagal: {det_kbli}[/dim yellow]")
 
-    # 5. Submit assignment (sama seperti cleaning_nik.py)
+    # 5. Submit
     console.print("   [bold cyan]📤 Melakukan Submit Assignment (CATATAN -> Kirim -> Konfirmasi)...[/bold cyan]")
     submit_ok, submit_msg = submit_assignment(page)
     if not submit_ok:
         return False, f"Gagal submit assignment: {submit_msg}"
 
     console.print(f"   [bold green]✔ Sukses Submit Assignment: {submit_msg}[/bold green]")
-    return True, f"5 Variabel + catatan (komentar otomatis #1 jika berubah, #0 jika sama; KBLI '{kbli_catatan}') disimpan, {submit_msg}"
+    return True, (
+        f"5 Variabel + catatan (komentar otomatis #1 jika berubah, #0 jika sama; "
+        f"KBLI '{kbli_catatan}') disimpan, {submit_msg}"
+    )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Batch Automation Update 5 Variabel Nilai (Blok 27) FASIH-SM SE2026 (1-Command)")
@@ -1126,16 +1148,22 @@ def main():
         table.add_column("Produksi", style="green")
         table.add_column("Operasional", style="green")
         table.add_column("Upah", style="green")
-        table.add_column("Komentar", style="yellow")
+        table.add_column("Timpa", style="red")
         table.add_column("Status Terakhir", style="yellow")
 
         for t in filtered_tasks[:20]:
             prev_status = progress_data.get(str(t["index"]), {}).get("status", "PENDING")
+            timpa_info = []
+            if _is_true(t.get("timpa_remark")):
+                timpa_info.append("semua")
+            for k in REMARK_KEYS:
+                if str(t.get("timpa_" + k, "")).strip() != "":
+                    timpa_info.append(f"{k.replace('remark_', '')}={t['timpa_' + k]}")
             table.add_row(
                 str(t["index"]), t["nama_usaha"],
                 t["nilai_penjualan"], t["biaya_pembelian"],
                 t["biaya_produksi"], t["biaya_operasional"], t["upah"],
-                t["komentar"], prev_status,
+                ", ".join(timpa_info) or "-", prev_status,
             )
 
         console.print(table)
@@ -1201,10 +1229,11 @@ def main():
                 )
                 console.print(f"Link    : [dim]{link}[/dim]")
 
-                # Proses per baris; kegagalan/exception tak terduga tidak menghentikan batch.
+                remarks = build_remarks(item)
                 try:
                     is_ok, msg = update_penjualan_row(
-                        page, link, nama_usaha, nilai, pembelian, produksi, operasional, upah, komentar
+                        page, link, nama_usaha, nilai, pembelian, produksi,
+                        operasional, upah, komentar, remarks=remarks,
                     )
                 except KeyboardInterrupt:
                     raise
@@ -1243,7 +1272,6 @@ def main():
 
         except KeyboardInterrupt:
             console.print("\n[bold yellow]⚠ Eksekusi dihentikan pengguna (Ctrl+C). Checkpoint tersimpan aman![/bold yellow]")
-            # Catat baris yang sedang diproses (belum selesai) sebagai FAILED agar diulang lain waktu.
             if current_item is not None:
                 idx_int = current_item["index"]
                 progress_data[str(idx_int)] = {
@@ -1279,4 +1307,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
