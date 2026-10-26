@@ -517,28 +517,62 @@ def _click_usaha_item(page: Page, nama_usaha: str) -> bool:
     """
     Membuka rincian sub-blok usaha pada section KETERANGAN USAHA/PERUSAHAAN.
     Mencari kartu nama usaha di content area (bukan aside) lalu mengkliknya.
+    Jika tidak ditemukan persis, akan mencari berdasarkan kemiripan (token/fuzzy).
     """
     target_js = json.dumps(nama_usaha)
 
     def make_script(do_click: bool) -> str:
         click_line = (
-            'match.scrollIntoView({ block: "center" }); match.click(); return true;'
-            if do_click else "return true;"
+            'let clickable = match; while (clickable && clickable !== document.body && !clickable.onclick && !String(clickable.className||"").includes("cursor-pointer")) { clickable = clickable.parentElement; } (clickable || match).scrollIntoView({ block: "center" }); (clickable || match).click(); return true;'
+            if do_click else "if (match) { match.scrollIntoView({ block: 'center' }); return true; } return false;"
         )
         return f"""(() => {{
-        const clean = (s) => (s || "").toLowerCase().replace(/\\s+/g, ' ').trim();
+        const clean = (s) => (s || "").toLowerCase().replace(/[\[\]\(\)\.\,\-\_\|\/\\:;]/g, ' ').replace(/\s+/g, ' ').trim();
         const target = clean({target_js});
-        const nodes = Array.from(document.querySelectorAll("body *")).filter(el =>
-            el.children.length === 0 && clean(el.textContent) === target
-        );
-        const match = nodes.find(el => !el.closest("aside"));
-        if (!match) return false;
+        if (!target) return false;
+        const targetTokens = target.split(' ').filter(x => x.length > 2);
+        const nodes = Array.from(document.querySelectorAll("body *")).filter(el => {{
+            if (el.closest("aside")) return false;
+            if (el.children.length !== 0) return false;
+            const t = clean(el.textContent);
+            if (!t || t.length < 3) return false;
+            return true;
+        }});
+        let best = null;
+        let bestScore = -1;
+        for (const el of nodes) {{
+            const t = clean(el.textContent);
+            if (!t) continue;
+            let score = 0;
+            if (t === target) {{ score = 1.0; }}
+            else if (t.includes(target) || target.includes(t)) {{ score = Math.max(score, 0.9); }}
+            else {{
+                let matchCount = 0;
+                for (let i = 0; i < targetTokens.length; i++) {{
+                    if (t.includes(targetTokens[i])) matchCount++;
+                }}
+                const tokenScore = targetTokens.length ? (matchCount / targetTokens.length) : 0;
+                score = Math.max(score, tokenScore * 0.8);
+                if (t.length > 0 && target.length > 0) {{
+                    let shorter = t.length < target.length ? t : target;
+                    let longer = t.length < target.length ? target : t;
+                    if (longer.includes(shorter)) score = Math.max(score, 0.7);
+                }}
+            }}
+            if (score > bestScore) {{
+                bestScore = score;
+                best = el;
+            }}
+        }}
+        if (!best || bestScore < 0.5) return false;
         {click_line}
     }})()"""
 
     _scroll_to_bottom(page)
     if not _scroll_to_bottom_until(page, make_script(do_click=False)):
-        return False
+        # coba lagi tanpa strict scroll check
+        if not bool(page.evaluate(make_script(do_click=False))):
+            return False
     ok = bool(page.evaluate(make_script(do_click=True)))
     if ok:
         time.sleep(1.5)

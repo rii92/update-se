@@ -12,10 +12,10 @@ hanya dengan 1 perintah:
    a. Membuka link kuesioner dalam mode edit (.../edit).
    b. Masuk section "KETERANGAN UMUM KELUARGA".
    c. Klik anggota keluarga sesuai kolom nama.
-   d. Klik tombol Catatan pada field NIK (wrapper prefix: nik_dtsen#),
-      isi catatan (default "#0"), simpan lalu tutup dialog.
-   e. Submit: Kirim -> cek validasi -> Kirim (modal) -> Konfirmasi
-      -> Kembali ke Review bila muncul.
+   d. Klik tombol Catatan pada field NIK (wrapper prefix: nik_dtsen#).
+   e. Mengisi catatan (default "#0"; catatan lama dipertahankan kecuali
+      timpa_remark = 1), simpan lalu tutup dialog.
+   f. Submit assignment (masuk CATATAN -> switch anomali -> Kirim -> Konfirmasi).
 5. Otomatis merekap hasil ke source/remark_nik_result.xlsx.
 
 Kolom file sumber (source/remark_nik.xlsx):
@@ -61,6 +61,7 @@ DEFAULT_SOURCE_FILE = Path("source/remark_nik.xlsx")
 NIK_WRAPPER_PREFIX = "nik_dtsen#"          # id wrapper field NIK (suffix dinamis: #3, #4, ...)
 SECTION_KEYWORD = "keterangan umum keluarga"
 DEFAULT_KOMENTAR = "#0"
+KIRIM_DELAY = 10.0                         # jeda (detik) sebelum klik Kirim; ubah via --delay-kirim
 
 _SCROLL_STEP_JS = """(step) => {
     window.scrollBy({ top: step, behavior: "instant" });
@@ -508,42 +509,111 @@ def _write_catatan(page: Page, wrapper_id: str, kom_to_fill: str, label: str, ti
 # Submit
 # ─────────────────────────────────────────────────────────────────────────────
 
-_CLICK_KIRIM_JS = """(() => {
-    const btns = Array.from(document.querySelectorAll("button"))
-        .filter(b => b.innerText.trim() === "Kirim" && b.offsetWidth > 0);
-    const btn = btns[btns.length - 1];
-    if (!btn) return false;
-    btn.scrollIntoView({ block: "center" });
-    btn.click();
-    return true;
-})()"""
-
-
 def submit_assignment(page: Page) -> Tuple[bool, str]:
     """
-    Kirim -> modal validasi (cek 0 galat) -> Kirim modal -> Konfirmasi
-    -> deteksi sukses -> klik 'Kembali ke Review' bila muncul.
-    Bila tombol Kirim belum terlihat di halaman anggota, masuk dulu ke menu CATATAN.
+    Proses submit kuesioner (sama seperti update_penjualan.py / cleaning_nik.py):
+    1. Masuk ke section CATATAN
+    2. Cek switch "Tampilkan Anomali Usaha dan Keluarga" (aktifkan jika belum)
+    3. Pastikan switch "Anomali diselesaikan oleh admin" tidak aktif
+    4. Klik Kirim utama -> Cek validasi 0 Galat -> Klik Kirim modal -> Konfirmasi final
     """
-    if not page.evaluate("""(() => Array.from(document.querySelectorAll("button"))
-            .some(b => b.innerText.trim() === "Kirim" && b.offsetWidth > 0))()"""):
-        if _click_menuitem(page, "catatan"):
-            time.sleep(1.5)
+    # 1. Masuk ke section CATATAN
+    click_catatan_ok = page.evaluate("""(() => {
+        const aside = document.querySelector("aside");
+        if (!aside) return false;
+        const elements = Array.from(aside.querySelectorAll("*")).filter(el => el.children.length === 0 && el.textContent.trim() === "CATATAN");
+        if (elements.length === 0) return false;
+        const target = elements[0];
+        let clickable = target;
+        while (clickable && clickable !== aside && !clickable.onclick && !String(clickable.className).includes("cursor-pointer")) {
+            clickable = clickable.parentElement;
+        }
+        (clickable || target).scrollIntoView({ block: "center" });
+        (clickable || target).click();
+        return true;
+    })()""")
 
+    if not click_catatan_ok:
+        return False, "Menu CATATAN tidak ditemukan di sidebar"
+
+    time.sleep(1.5)
+
+    # 2. Cek switch di blok CATATAN:
+    # - "Tampilkan Anomali Usaha dan Keluarga" jika sudah dichecklist JANGAN dichecklist lagi.
+    # - JANGAN checklist "Anomali diselesaikan oleh admin".
+    # - JANGAN memberi catatan penjelasan anomali admin.
+    page.evaluate("""(() => {
+        const rows = Array.from(document.querySelectorAll("div[class*='rounded-lg'], div[class*='gap-2'], div[class*='flex'], label"));
+
+        // Cari switch "Tampilkan Anomali Usaha dan Keluarga" (hindari baris admin)
+        const anomaliRow = rows.find(r => {
+            const t = (r.innerText || "").toLowerCase();
+            return t.includes("tampilkan anomali") && !t.includes("admin");
+        });
+
+        if (anomaliRow) {
+            const input = anomaliRow.querySelector("input[role='switch'], input[type='checkbox']");
+            if (input) {
+                const isChecked = input.checked ||
+                                  input.getAttribute("aria-checked") === "true" ||
+                                  input.hasAttribute("data-checked");
+                if (!isChecked) {
+                    const control = anomaliRow.querySelector("[id*='control']") || input;
+                    control.click();
+                }
+            }
+        }
+
+        // Pastikan switch "Anomali diselesaikan oleh admin" TIDAK DICHECKLIST (jika sempat aktif, uncheck)
+        const adminRow = rows.find(r => {
+            const t = (r.innerText || "").toLowerCase();
+            return t.includes("anomali diselesaikan oleh admin");
+        });
+        if (adminRow) {
+            const adminInput = adminRow.querySelector("input[role='switch'], input[type='checkbox']");
+            if (adminInput) {
+                const isAdminChecked = adminInput.checked ||
+                                       adminInput.getAttribute("aria-checked") === "true" ||
+                                       adminInput.hasAttribute("data-checked");
+                if (isAdminChecked) {
+                    const adminControl = adminRow.querySelector("[id*='control']") || adminInput;
+                    adminControl.click();
+                }
+            }
+        }
+    })()""")
+
+    time.sleep(1.0)
+
+    # Jeda sebelum klik Kirim (beri waktu catatan & switch tersimpan di server)
+    if KIRIM_DELAY > 0:
+        console.print(f"   [dim]⏳ Menunggu {KIRIM_DELAY:g} detik sebelum klik Kirim...[/dim]")
+        time.sleep(KIRIM_DELAY)
+
+    # 3. Klik tombol Kirim utama (ulangi bila modal validasi belum muncul)
     modal_opened = False
     for _ in range(3):
-        page.evaluate(_CLICK_KIRIM_JS)
+        page.evaluate("""(() => {
+            const btns = Array.from(document.querySelectorAll("button")).filter(b => b.innerText.trim() === "Kirim" && b.offsetWidth > 0);
+            const btn = btns[btns.length - 1];
+            if (btn) {
+                btn.scrollIntoView({ block: "center" });
+                btn.click();
+            }
+        })()""")
         try:
             page.wait_for_selector("[class*='max-w-lg'], [role='dialog']", timeout=6000)
             modal_opened = True
             break
         except Exception:
             time.sleep(1.0)
+
     if not modal_opened:
         return False, "Modal ringkasan validasi tidak muncul"
 
     time.sleep(1.0)
 
+    # 4. Validasi 0 Galat & Klik Kirim di modal
     val_res = page.evaluate("""(() => {
         const modal = document.querySelector("[class*='max-w-lg'], [role='dialog']");
         if (!modal) return { status: "ERR", msg: "Modal validasi tidak ditemukan" };
@@ -561,34 +631,26 @@ def submit_assignment(page: Page) -> Tuple[bool, str]:
         btns[0].click();
         return { status: "OK" };
     })()""")
+
     if val_res.get("status") != "OK":
         return False, f"Validasi gagal: {val_res.get('msg')}"
 
+    # 5. Klik tombol Konfirmasi pada dialog akhir
     try:
         page.wait_for_selector("button:has-text('Konfirmasi')", timeout=10000)
         page.locator("button:has-text('Konfirmasi')").first.click()
     except Exception:
         return False, "Tombol 'Konfirmasi' dialog akhir tidak ditemukan"
 
+    # 6. Verifikasi submit selesai
     try:
         page.wait_for_function("""() => {
             const t = document.body ? document.body.innerText : "";
-            const back = Array.from(document.querySelectorAll("button"))
-                .some(b => b.innerText.trim() === "Kembali ke Review" && b.offsetWidth > 0);
-            return back || t.includes("Assignment Berhasil Disubmit") || t.includes("Perubahan Anda berhasil disimpan");
+            return t.includes("Assignment Berhasil Disubmit") || t.includes("Perubahan Anda berhasil disimpan");
         }""", timeout=15000)
+        return True, "Assignment Berhasil Disubmit"
     except Exception:
         return False, "Status sukses submit tidak terdeteksi pada layar"
-
-    # Tutup dialog pasca-submit (recording: 'Kembali ke Review')
-    try:
-        back = page.locator("button:has-text('Kembali ke Review')")
-        if back.count() > 0 and back.first.is_visible():
-            back.first.click(timeout=5000)
-            time.sleep(0.8)
-    except Exception:
-        pass
-    return True, "Assignment Berhasil Disubmit"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -655,8 +717,8 @@ def remark_nik_row(
     else:
         console.print(f"   [dim]↳ Catatan NIK: catatan lama '{status[5:]}' dipertahankan (timpa_remark bukan 1)[/dim]")
 
-    # 4. Submit
-    console.print("   [bold cyan]📤 Submit Assignment (Kirim -> Konfirmasi)...[/bold cyan]")
+    # 4. Submit assignment (CATATAN -> switch anomali -> Kirim -> Konfirmasi)
+    console.print("   [bold cyan]📤 Melakukan Submit Assignment (CATATAN -> Kirim -> Konfirmasi)...[/bold cyan]")
     submit_ok, submit_msg = submit_assignment(page)
     if not submit_ok:
         return False, f"Gagal submit assignment: {submit_msg}"
@@ -670,6 +732,7 @@ def remark_nik_row(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    global KIRIM_DELAY
     parser = argparse.ArgumentParser(description="Batch Automation Remark NIK FASIH-SM SE2026 (1-Command)")
     parser.add_argument("--source", default=str(DEFAULT_SOURCE_FILE), help="File Excel sumber (default: source/remark_nik.xlsx)")
     parser.add_argument("--init-sample", action="store_true", help="Buat file Excel sumber contoh lalu keluar")
@@ -677,10 +740,13 @@ def main():
     parser.add_argument("--end", type=int, default=None, help="Nomor baris akhir")
     parser.add_argument("--limit", type=int, default=None, help="Jumlah baris maksimum yang diproses")
     parser.add_argument("--delay", type=float, default=1.5, help="Jeda antar baris dalam detik (default: 1.5)")
+    parser.add_argument("--delay-kirim", type=float, default=KIRIM_DELAY, help="Jeda sebelum klik Kirim dalam detik (default: 10)")
     parser.add_argument("--force", action="store_true", help="Proses ulang semua baris meskipun sudah SUCCESS")
     parser.add_argument("--headless", action="store_true", help="Jalankan tanpa jendela Chrome")
     parser.add_argument("--dry-run", action="store_true", help="Hanya tampilkan daftar baris tanpa eksekusi")
     args = parser.parse_args()
+
+    KIRIM_DELAY = args.delay_kirim
 
     source_path = Path(args.source)
 

@@ -14,6 +14,7 @@ session.json
 *.session
 screenshots/
 *.png
+source/
 
 # Checkpoints & Results
 source/*_progress.json
