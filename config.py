@@ -9,8 +9,8 @@ BROWSER_CHANNEL = "chrome"  # Menggunakan Google Chrome yang sudah terinstal di 
 BROWSER_DATA_DIR = BASE_DIR / "chrome_data"
 
 # SSO BPS Credentials (dapat disesuaikan oleh pengguna lain)
-SSO_USERNAME = os.getenv("SSO_USERNAME", "arini.larasati")
-SSO_PASSWORD = os.getenv("SSO_PASSWORD", "netralje")
+SSO_USERNAME = os.getenv("SSO_USERNAME", "aan.priawan")
+SSO_PASSWORD = os.getenv("SSO_PASSWORD", "daktaunian")
 AUTO_LOGIN_SSO = os.getenv("AUTO_LOGIN_SSO", "true").lower() in ("true", "1", "yes")
 
 # URLs

@@ -6,7 +6,9 @@ Menambahkan catatan (remark) pada field NIK anggota keluarga di section
 hanya dengan 1 perintah:
 
 1. Otomatis membuka Google Chrome dengan profil terisolasi (config.BROWSER_DATA_DIR).
-2. Otomatis login SSO BPS jika belum login / sesi habis.
+2. Otomatis login SSO BPS jika belum login / sesi habis. Bila login gagal (timeout SSO):
+   refresh browser 3x lalu login ulang. Bila login gagal berturut-turut, proses
+   dihentikan otomatis (lihat --max-login-gagal) agar baris tidak habis ditandai FAILED.
 3. Otomatis melewati baris yang sudah SUCCESS sebelumnya (checkpoint).
 4. Untuk setiap baris:
    a. Membuka link kuesioner dalam mode edit (.../edit).
@@ -62,6 +64,8 @@ NIK_WRAPPER_PREFIX = "nik_dtsen#"          # id wrapper field NIK (suffix dinami
 SECTION_KEYWORD = "keterangan umum keluarga"
 DEFAULT_KOMENTAR = "#0"
 KIRIM_DELAY = 10.0                         # jeda (detik) sebelum klik Kirim; ubah via --delay-kirim
+REFRESH_LOGIN = 3                          # jumlah refresh browser sebelum login ulang; ubah via --refresh-login
+LOGIN_FAIL_MSG = "Login gagal setelah refresh browser dan login ulang"
 
 _SCROLL_STEP_JS = """(step) => {
     window.scrollBy({ top: step, behavior: "instant" });
@@ -275,6 +279,22 @@ def is_page_logged_out(page: Page) -> bool:
         return False
 
 
+def _wait_sso_or_app(page: Page, timeout: float = 30.0) -> str:
+    """
+    Tunggu sampai browser berada di halaman SSO ("sso"), atau sudah masuk aplikasi
+    karena sesi SSO masih aktif ("app"). Mengembalikan "timeout" bila keduanya tidak terjadi.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        url = page.url.lower()
+        if "sso.bps.go.id" in url:
+            return "sso"
+        if "fasih-sm.bps.go.id/app" in url and not is_page_logged_out(page):
+            return "app"
+        time.sleep(0.5)
+    return "timeout"
+
+
 def perform_sso_login(page: Page, username: str = config.SSO_USERNAME, password: str = config.SSO_PASSWORD) -> bool:
     console.print(f"[bold yellow]🔐 Login otomatis SSO BPS (User: {username})...[/bold yellow]")
     try:
@@ -286,8 +306,15 @@ def perform_sso_login(page: Page, username: str = config.SSO_USERNAME, password:
             if sso_btn.count() > 0 and sso_btn.first.is_visible():
                 sso_btn.first.click()
             else:
-                page.goto("https://fasih-sm.bps.go.id/oauth2/authorization/ics", wait_until="domcontentloaded")
-            page.wait_for_url("**/sso.bps.go.id/**", timeout=20000)
+                page.goto("https://fasih-sm.bps.go.id/oauth2/authorization/ics", wait_until="commit", timeout=30000)
+
+            state = _wait_sso_or_app(page, 30.0)
+            if state == "app":
+                console.print("[bold green]✔ Sesi SSO masih aktif, langsung masuk aplikasi[/bold green]")
+                time.sleep(1.5)
+                return True
+            if state != "sso":
+                raise TimeoutError("tidak diarahkan ke halaman SSO dalam 30 detik")
 
         page.wait_for_selector("#username", timeout=15000)
         page.fill("#username", username)
@@ -300,6 +327,38 @@ def perform_sso_login(page: Page, username: str = config.SSO_USERNAME, password:
     except Exception as e:
         console.print(f"[bold red]❌ Gagal login otomatis SSO: {e}[/bold red]")
         return False
+
+
+def login_with_recovery(page: Page, target_url: Optional[str] = None, refresh_times: Optional[int] = None) -> bool:
+    """
+    Login SSO dengan pemulihan: bila login gagal (mis. timeout menunggu halaman SSO),
+    refresh browser sebanyak `refresh_times` (default REFRESH_LOGIN = 3) lalu login ulang.
+    """
+    n = REFRESH_LOGIN if refresh_times is None else refresh_times
+    if perform_sso_login(page):
+        return True
+    if n <= 0:
+        return False
+
+    console.print(f"[yellow]⚠ Login gagal. Refresh browser {n}x lalu login ulang...[/yellow]")
+    for i in range(1, n + 1):
+        console.print(f"   [yellow]🔄 Refresh browser {i}/{n}[/yellow]")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            console.print(f"   [dim yellow]Refresh gagal ({e}); membuka ulang halaman...[/dim yellow]")
+            try:
+                page.goto(target_url or f"{config.FASIH_BASE_URL}/app/", wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+        time.sleep(3.0)
+
+    console.print("[yellow]🔐 Login ulang setelah refresh...[/yellow]")
+    return perform_sso_login(page)
+
+
+def _is_login_failure(msg: str) -> bool:
+    return msg.startswith(LOGIN_FAIL_MSG) or msg.startswith("Sesi login habis")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -679,15 +738,19 @@ def remark_nik_row(
     time.sleep(1.0)
 
     if is_page_logged_out(page):
-        if retry_on_logout and perform_sso_login(page):
-            return _retry()
+        if retry_on_logout:
+            if login_with_recovery(page, edit_url):
+                return _retry()
+            return False, LOGIN_FAIL_MSG
         return False, "Sesi login habis / terlogout"
 
     try:
         page.wait_for_selector("aside", timeout=20000)
     except Exception:
-        if is_page_logged_out(page) and retry_on_logout and perform_sso_login(page):
-            return _retry()
+        if is_page_logged_out(page) and retry_on_logout:
+            if login_with_recovery(page, edit_url):
+                return _retry()
+            return False, LOGIN_FAIL_MSG
         return False, "Menu sidebar (aside) kuesioner tidak muncul"
     time.sleep(1.0)
 
@@ -732,7 +795,7 @@ def remark_nik_row(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global KIRIM_DELAY
+    global KIRIM_DELAY, REFRESH_LOGIN
     parser = argparse.ArgumentParser(description="Batch Automation Remark NIK FASIH-SM SE2026 (1-Command)")
     parser.add_argument("--source", default=str(DEFAULT_SOURCE_FILE), help="File Excel sumber (default: source/remark_nik.xlsx)")
     parser.add_argument("--init-sample", action="store_true", help="Buat file Excel sumber contoh lalu keluar")
@@ -741,12 +804,15 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Jumlah baris maksimum yang diproses")
     parser.add_argument("--delay", type=float, default=1.5, help="Jeda antar baris dalam detik (default: 1.5)")
     parser.add_argument("--delay-kirim", type=float, default=KIRIM_DELAY, help="Jeda sebelum klik Kirim dalam detik (default: 10)")
+    parser.add_argument("--refresh-login", type=int, default=REFRESH_LOGIN, help="Jumlah refresh browser sebelum login ulang bila login gagal (default: 3)")
+    parser.add_argument("--max-login-gagal", type=int, default=5, help="Hentikan proses setelah N baris berturut-turut gagal login; 0 = tidak dihentikan (default: 5)")
     parser.add_argument("--force", action="store_true", help="Proses ulang semua baris meskipun sudah SUCCESS")
     parser.add_argument("--headless", action="store_true", help="Jalankan tanpa jendela Chrome")
     parser.add_argument("--dry-run", action="store_true", help="Hanya tampilkan daftar baris tanpa eksekusi")
     args = parser.parse_args()
 
     KIRIM_DELAY = args.delay_kirim
+    REFRESH_LOGIN = args.refresh_login
 
     source_path = Path(args.source)
 
@@ -828,7 +894,7 @@ def main():
             time.sleep(2.0)
             if is_page_logged_out(page):
                 console.print("[yellow]⚠ Status awal logout! Login otomatis SSO BPS...[/yellow]")
-                if not perform_sso_login(page):
+                if not login_with_recovery(page):
                     console.print("[bold red]❌ Gagal login otomatis SSO. Proses dibatalkan.[/bold red]")
                     context.close()
                     return
@@ -837,6 +903,7 @@ def main():
 
         success_count = 0
         fail_count = 0
+        login_fail_streak = 0
         current_item = None
 
         def record(item: dict, status: str, detail: str):
@@ -875,6 +942,18 @@ def main():
                 else:
                     fail_count += 1
                     console.print(f"[bold red]❌ #{idx} Gagal: {msg}[/bold red]")
+
+                if not is_ok and _is_login_failure(msg):
+                    login_fail_streak += 1
+                else:
+                    login_fail_streak = 0
+                if args.max_login_gagal and login_fail_streak >= args.max_login_gagal:
+                    console.print(
+                        f"[bold red]⛔ Gagal login {login_fail_streak}x berturut-turut. Proses dihentikan "
+                        f"(sisa baris belum diproses). Periksa koneksi / SSO, lalu jalankan ulang; "
+                        f"baris FAILED otomatis dicoba lagi.[/bold red]"
+                    )
+                    break
 
                 if i % 10 == 0 or i == len(filtered_tasks):
                     export_result_excel(all_tasks, progress_data, RESULT_EXCEL_FILE)
